@@ -1231,7 +1231,7 @@ export async function syncReferenceEntities(
 
 export const model = {
   type: "@shrug/invoiceninja",
-  version: "2026.07.18.4",
+  version: "2026.07.19.1",
   description:
     "Invoice Ninja v5 (/api/v1): read invoices/payments/expenses + mapping " +
     "lists, an idempotent gated-write upsertExpense (dedup on custom_value1), and " +

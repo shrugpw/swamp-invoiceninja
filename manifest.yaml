@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@shrug/invoiceninja"
-version: "2026.07.18.4"
+version: "2026.07.19.1"
 description: "Invoice Ninja v5 (/api/v1) model: read invoices, payments, expenses, and vendor/category mapping lists; an idempotent gated-write upsertExpense that dedups bank transactions on custom_value1; and a mapping-write path (upsertVendors, upsertExpenseCategories, buildMapping) that auto-creates reference data and derives the Mapping. Curated overlays translate raw vendor/category names (vendorOverlay, categoryOverlay) and assign a category by vendor with hard-override precedence (vendorCategoryOverlay → the disjoint mapping.vendorCategories tier, which wins over Mercury's rawCategory). Header token auth (vaulted), X-Requested-With mandatory; every write gated behind dryRun (default true)."
 
 # TODO(publish): confirm the real GitHub URL before the first push (Phase 5).
@@ -8,6 +8,7 @@ repository: https://github.com/shrugpw/swamp-invoiceninja
 
 additionalFiles:
   - README.md
+  - LICENSE.txt
 
 models:
   - invoiceninja.ts
