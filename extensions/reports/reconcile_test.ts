@@ -78,8 +78,12 @@ function syncRow(p: Record<string, unknown> = {}) {
 }
 
 /** An IN expenses row (only id + customValue1 are read by the dup backstop). */
-function inExpense(customValue1: string, id = "e") {
-  return { id, customValue1 };
+function inExpense(
+  customValue1: string,
+  id = "e",
+  extra: Record<string, unknown> = {},
+) {
+  return { id, customValue1, ...extra };
 }
 
 // deno-lint-ignore no-explicit-any
@@ -356,6 +360,28 @@ Deno.test("duplicate via the authoritative IN expenses snapshot", async () => {
     count: 2,
     source: "in-expenses",
   }]);
+});
+
+Deno.test("a soft-deleted IN expense is not counted toward the duplicate backstop", async () => {
+  // IN returns soft-deleted expenses in both with_trashed states. A deleted row
+  // sharing a live row's custom_value1 must NOT raise a phantom DUPLICATE — the
+  // key's only live expense is singular, so the run is caught up.
+  const out = await run([
+    { name: "transactions", bytes: snapshot([bt({ id: "t1", amount: 100 })]) },
+    {
+      name: "expenseSync",
+      bytes: expenseSync([syncRow({ dedupKey: "t1", amount: 100 })]),
+    },
+    {
+      name: "expenses",
+      bytes: snapshot([
+        inExpense("t1", "e-live"),
+        inExpense("t1", "e-dead", { isDeleted: true }), // deleted → not a dup
+      ]),
+    },
+  ]);
+  assertEquals(out.json.duplicates, []);
+  assertEquals(out.json.caughtUp, true);
 });
 
 Deno.test("duplicate falls back to expenseSync 'created' rows only when no expenses snapshot", async () => {

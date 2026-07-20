@@ -18,6 +18,7 @@ import {
   mdCell,
   money,
   nameIndex,
+  notDeleted,
   readItems,
   type ReportCtx,
 } from "./_lib/snapshots.ts";
@@ -104,10 +105,15 @@ export const report = {
   execute: async (
     ctx: ReportCtx,
   ): Promise<{ markdown: string; json: Record<string, unknown> }> => {
-    const { items: expenses, retrievedAt } = await readItems<ExpenseRow>(
+    const { items: rawExpenses, retrievedAt } = await readItems<ExpenseRow>(
       ctx,
       "expenses",
     );
+    // IN's `listExpenses` returns soft-deleted/archived expenses in both
+    // with_trashed states — filter them out up front so no deleted row's amount
+    // is counted in any section (totals, by-category/vendor, billable backlog).
+    const expenses = rawExpenses.filter(notDeleted);
+    const deletedExcluded = rawExpenses.length - expenses.length;
     const { items: categories } = await readItems<MapRow>(
       ctx,
       "expenseCategories",
@@ -160,10 +166,16 @@ export const report = {
     const notes: string[] = [];
     if (!retrievedAt) {
       notes.push("No `expenses` snapshot found — run `listExpenses` first.");
-    } else if (expenses.length === 0) {
+    } else if (rawExpenses.length === 0) {
       notes.push(`Snapshot ${retrievedAt} is empty (0 expenses).`);
     } else {
       notes.push(`Snapshot: ${retrievedAt}. Period: ${periodLabel}.`);
+    }
+    if (deletedExcluded > 0) {
+      notes.push(
+        `${deletedExcluded} soft-deleted expense(s) were excluded from all ` +
+          "totals (Invoice Ninja returns deleted rows in both with_trashed states).",
+      );
     }
     if (from || to) {
       notes.push(

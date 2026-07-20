@@ -362,3 +362,47 @@ Deno.test("byCategory / byVendor group totals reconcile with the grand total", a
   assertEquals(venSum, out.total);
   assertEquals(out.total, 35);
 });
+
+Deno.test("soft-deleted expenses are excluded from every total (with_trashed leak)", async () => {
+  const out = json(
+    await report.execute(ctxWith({
+      expenses: [
+        exp({ id: "live", categoryId: "cat-a", amount: 100 }),
+        // IN returns these in both with_trashed states; neither may be counted.
+        exp({ id: "gone", categoryId: "cat-a", amount: 999, isDeleted: true }),
+        exp({
+          id: "gone-billable",
+          amount: 500,
+          shouldBeInvoiced: true,
+          invoiceId: null,
+          isDeleted: true,
+        }),
+      ],
+      categories: [{ id: "cat-a", name: "Travel" }],
+    })),
+  );
+  // Only the one live $100 row counts; the $999 + $500 deleted rows drop out.
+  assertEquals(out.expenseCount, 1);
+  assertEquals(out.total, 100);
+  assertEquals(out.byCategory, [{
+    key: "cat-a",
+    label: "Travel",
+    count: 1,
+    total: 100,
+  }]);
+  // The deleted billable row must not inflate the all-time backlog either.
+  assertEquals(out.billableUninvoiced.count, 0);
+  assertEquals(out.billableUninvoiced.total, 0);
+});
+
+Deno.test("absent isDeleted keeps a row (pre-fix snapshot, back-compat)", async () => {
+  // `exp()` omits isDeleted entirely — a pre-fix snapshot has no such field, and
+  // it must still be counted (notDeleted treats absent as not-deleted).
+  const out = json(
+    await report.execute(
+      ctxWith({ expenses: [exp({ id: "old", amount: 42 })] }),
+    ),
+  );
+  assertEquals(out.expenseCount, 1);
+  assertEquals(out.total, 42);
+});

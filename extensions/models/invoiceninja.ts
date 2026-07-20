@@ -329,12 +329,20 @@ const ExpenseSchema = z.object({
   customValue1: z.string().nullable().describe(
     "Dedup key mirror (bank txn id)",
   ),
+  // Deletion state (additive, back-compat). IN's `listExpenses` returns
+  // soft-deleted/archived expenses in BOTH with_trashed states, so the
+  // downstream reports (expense-summary, reconcile) must be able to EXCLUDE a
+  // deleted row or its amount is silently counted. Absent ⇒ not deleted (a
+  // pre-fix snapshot keeps working — mirrors InvoiceSchema/MapItemSchema).
+  isDeleted: z.boolean().nullable(),
+  archivedAt: z.number().nullable().describe("Unix ts; 0/absent → null"),
 });
 
 /** Normalize a raw `/expenses` row. */
 export function normalizeExpense(
   raw: Record<string, unknown>,
 ): z.infer<typeof ExpenseSchema> {
+  const archivedAt = numOrNull(raw.archived_at);
   return {
     id: strOrNull(raw.id) ?? "",
     amount: numOrNull(raw.amount),
@@ -348,6 +356,8 @@ export function normalizeExpense(
     derivedStatus: derivedExpenseStatus(raw),
     shouldBeInvoiced: boolOrNull(raw.should_be_invoiced),
     customValue1: strOrNull(raw.custom_value1),
+    isDeleted: boolOrNull(raw.is_deleted),
+    archivedAt: archivedAt && archivedAt > 0 ? archivedAt : null,
   };
 }
 
@@ -1231,7 +1241,7 @@ export async function syncReferenceEntities(
 
 export const model = {
   type: "@shrug/invoiceninja",
-  version: "2026.07.19.1",
+  version: "2026.07.19.2",
   description:
     "Invoice Ninja v5 (/api/v1): read invoices/payments/expenses + mapping " +
     "lists, an idempotent gated-write upsertExpense (dedup on custom_value1), and " +

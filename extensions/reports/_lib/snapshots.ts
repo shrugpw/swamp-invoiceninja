@@ -134,12 +134,31 @@ export interface ExpenseRow {
   derivedStatus: string | null;
   shouldBeInvoiced: boolean | null;
   customValue1: string | null;
+  // Deletion state (mirrors ExpenseSchema). IN's `listExpenses` returns
+  // soft-deleted/archived expenses in BOTH with_trashed states; a report that
+  // counts every row would silently include deleted expenses. Absent ⇒ kept
+  // (a pre-fix snapshot has neither field — see `notDeleted`).
+  isDeleted?: boolean | null;
+  archivedAt?: number | null;
 }
 
 /** A `{ id, name }` mapping row (`vendors`, `expenseCategories`). */
 export interface MapRow {
   id: string;
   name: string | null;
+}
+
+/**
+ * Whether a snapshot row is NOT soft-deleted. IN returns soft-deleted/archived
+ * rows in BOTH `with_trashed` states, so a report that aggregates every returned
+ * row would silently count a deleted expense's amount (or a deleted expense's
+ * `custom_value1` as an active duplicate). `!== true` treats an ABSENT
+ * `isDeleted` (a pre-fix snapshot) as NOT deleted — back-compat, so an older
+ * snapshot reports unchanged. Archived-but-not-deleted rows are kept (IN still
+ * treats them as real expenses), mirroring the model's `notDeleted`.
+ */
+export function notDeleted(row: { isDeleted?: boolean | null }): boolean {
+  return row.isDeleted !== true;
 }
 
 /** Build an `id → name` lookup from a mapping snapshot, for label enrichment. */

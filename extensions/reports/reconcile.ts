@@ -31,6 +31,7 @@ import {
   type ExpenseRow,
   mdCell,
   money,
+  notDeleted,
   parseSnapshot,
 } from "./_lib/snapshots.ts";
 
@@ -247,6 +248,11 @@ export const report = {
         } else if (looksLikeExpenses(items)) {
           sawExpensesSnapshot = true;
           for (const e of items) {
+            // A soft-deleted IN expense is not an active duplicate — IN returns
+            // deleted rows in both with_trashed states, so counting one would
+            // raise a phantom DUPLICATE for a key whose only live expense is
+            // singular. Absent isDeleted ⇒ kept (pre-fix snapshot, back-compat).
+            if (!notDeleted(e)) continue;
             const k = e.customValue1;
             if (!k) continue; // ignore blank custom_value1 (not a dedup key)
             inExpenseKeyCounts.set(k, (inExpenseKeyCounts.get(k) ?? 0) + 1);

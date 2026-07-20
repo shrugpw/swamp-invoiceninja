@@ -203,6 +203,44 @@ Deno.test("normalizeExpense() mirrors custom_value1 + derives status", () => {
   assertEquals(exp.customValue1, "mercury-txn-abc");
   assertEquals(exp.currencyId, "1");
   assertEquals(exp.derivedStatus, "pending");
+  // Deletion fields default to null when absent (a live row / pre-fix response).
+  assertEquals(exp.isDeleted, null);
+  assertEquals(exp.archivedAt, null);
+});
+
+Deno.test("normalizeExpense() parses is_deleted/archived_at (with_trashed leak fix)", () => {
+  // IN's listExpenses returns soft-deleted/archived expenses in both
+  // with_trashed states; the read schema must surface them so reports exclude.
+  assertEquals(
+    normalizeExpense({
+      id: "exp-del",
+      amount: "9.99",
+      custom_value1: "mercury-txn-del",
+      is_deleted: true,
+      archived_at: 1720000000,
+    }),
+    {
+      id: "exp-del",
+      amount: 9.99,
+      date: null,
+      paymentDate: null,
+      categoryId: null,
+      vendorId: null,
+      clientId: null,
+      invoiceId: null,
+      currencyId: null,
+      derivedStatus: "logged",
+      shouldBeInvoiced: null,
+      customValue1: "mercury-txn-del",
+      isDeleted: true,
+      archivedAt: 1720000000,
+    },
+  );
+  // archived_at 0 → null (mirrors normalizeInvoice/normalizeMapItem).
+  assertEquals(
+    normalizeExpense({ id: "e", is_deleted: false, archived_at: 0 }).archivedAt,
+    null,
+  );
 });
 
 Deno.test("normalizeMapItem() reduces to {id, name, isDeleted, archivedAt}", () => {
