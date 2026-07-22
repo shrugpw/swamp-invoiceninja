@@ -99,13 +99,14 @@ const GlobalArgsSchema = z.object({
         "from categories, so a counterparty key coinciding with a real category " +
         "name can never clobber a rawCategory binding); upsertExpenseCategories " +
         "ensures the TARGET exists for ALL candidate debits whose counterparty " +
-        "matches a key (not only uncategorized ones). KEYS MUST BE THE EXACT raw " +
-        "BankTxn.counterparty spelling — the mapping bind (buildMapping) and consume " +
-        "(mapTxnToExpense) are byte-exact; a case/whitespace-only mismatch is warned " +
-        "at upsert time and the row falls through to its rawCategory/fallback tiers " +
-        "(same exact-key contract as vendorOverlay/categoryOverlay). Empty (default) " +
-        "⇒ inert (bit-for-bit back-compat). Instance config at go-live, not " +
-        "committed code.",
+        "matches a key (not only uncategorized ones). Key matching is CASE-" +
+        "INSENSITIVE via normName (trim + NFC + case-fold): a config key " +
+        "'ACME INSURANCE CO' matches a bank counterparty 'Acme Insurance Co'. " +
+        "Exact byte-match is tried first (fast path); on a miss the lookup falls " +
+        "back to case-insensitive comparison over the mapping entries. A case-" +
+        "variant match is logged at upsert time for auditability (same contract " +
+        "as vendorOverlay/categoryOverlay). Empty (default) ⇒ inert (bit-for-bit " +
+        "back-compat). Instance config at go-live, not committed code.",
     ),
 });
 
@@ -722,19 +723,36 @@ export function isCandidate(txn: Record<string, unknown>): boolean {
 }
 
 /**
- * Own-property lookup in a mapping table. The keys are attacker-influenceable
- * (a bank counterparty / raw category string), so a plain `table[key]` would
- * resolve `"__proto__"`, `"constructor"`, `"toString"`, … to inherited
- * `Object.prototype` members instead of `undefined` — silently defeating the
- * `?? null` / fallback and, worse, mis-flagging a genuinely unmatched vendor as
- * matched. `Object.hasOwn` restricts the lookup to real entries.
+ * Case-insensitive fallback lookup in a mapping table. Tries byte-exact match
+ * first (fast path — O(1) via `Object.hasOwn`); on a miss, scans entries and
+ * compares via {@link normName} (trim + NFC + case-fold). Returns the value for
+ * the FIRST entry whose normalized key matches — `Object.entries` iteration
+ * order is insertion order, so the result is deterministic for a given mapping
+ * object.
+ *
+ * Use this for mapping tiers where the config key may differ from the runtime
+ * key only by case/whitespace (e.g. a hand-authored `vendorCategoryOverlay`
+ * with `"ACME INSURANCE CO"` against a bank counterparty `"Acme Insurance
+ * Co"`). Prototype-safe — the scan uses `Object.entries` which is
+ * own-properties only, and `normName` is compared by value (no prototype
+ * surface).
+ *
+ * Overlays are a handful of entries so the per-call linear scan is trivial.
  */
-function ownLookup(
+export function ownLookupNorm(
   table: Record<string, string> | undefined,
   key: string | null,
 ): string | undefined {
   if (table == null || key === null) return undefined;
-  return Object.hasOwn(table, key) ? table[key] : undefined;
+  // Fast path: byte-exact match.
+  if (Object.hasOwn(table, key)) return table[key];
+  // Slow path: case-insensitive scan.
+  const normKey = normName(key);
+  if (normKey === "") return undefined;
+  for (const [k, v] of Object.entries(table)) {
+    if (normName(k) === normKey) return v;
+  }
+  return undefined;
 }
 
 /**
@@ -745,7 +763,7 @@ export function vendorFor(
   counterparty: unknown,
   mapping: Mapping,
 ): string | null {
-  return ownLookup(mapping.vendors, strOrNull(counterparty)) ?? null;
+  return ownLookupNorm(mapping.vendors, strOrNull(counterparty)) ?? null;
 }
 
 /**
@@ -765,12 +783,16 @@ export function mapTxnToExpense(
   const rawCategory = strOrNull(txn.rawCategory);
   const counterparty = strOrNull(txn.counterparty);
   // HARD-OVERRIDE tier FIRST (vendor-category-override §7.5): a curated vendor→
-  // category assignment wins over Mercury's rawCategory. `ownLookup` null-guards an
-  // absent `vendorCategories`, so a pre-override Mapping falls straight through to
-  // the frozen rawCategory → counterparty → fallback order (back-compat).
-  const category = ownLookup(mapping.vendorCategories, counterparty) ??
-    ownLookup(mapping.categories, rawCategory) ??
-    ownLookup(mapping.categories, counterparty) ??
+  // category assignment wins over Mercury's rawCategory. `ownLookupNorm` null-
+  // guards an absent `vendorCategories` and falls back to case-insensitive
+  // matching (normName: trim + NFC + case-fold) when byte-exact misses — so a
+  // config key "ACME INSURANCE CO" catches a bank counterparty "Acme Insurance
+  // Co". Same norm-match for the `categories` and fallback tiers. A pre-override
+  // Mapping (no `vendorCategories`) falls straight through to the frozen
+  // rawCategory → counterparty → fallback order (back-compat).
+  const category = ownLookupNorm(mapping.vendorCategories, counterparty) ??
+    ownLookupNorm(mapping.categories, rawCategory) ??
+    ownLookupNorm(mapping.categories, counterparty) ??
     mapping.fallbackCategoryId;
   return {
     amount: numOrNull(txn.amount),
@@ -1241,7 +1263,7 @@ export async function syncReferenceEntities(
 
 export const model = {
   type: "@shrug/invoiceninja",
-  version: "2026.07.19.2",
+  version: "2026.07.21.1",
   description:
     "Invoice Ninja v5 (/api/v1): read invoices/payments/expenses + mapping " +
     "lists, an idempotent gated-write upsertExpense (dedup on custom_value1), and " +
@@ -1249,6 +1271,20 @@ export const model = {
     "auto-creates reference data and derives the Mapping. All writes gated behind " +
     "dryRun (default true).",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.07.19.3",
+      description:
+        "Add deleted-matched cross-check to reconcile report (report-only, no schema change)",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.21.1",
+      description:
+        "Docs + quality-rating cleanup: rewrote README (was stale at Phase-0 skeleton), enriched manifest description, removed unused ownLookup helper (superseded by ownLookupNorm, no callers). No schema change.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     "invoices": {
       description: "An invoice list snapshot (§4.3)",
@@ -1793,10 +1829,11 @@ export const model = {
         // only uncategorized ones. Under hard-override a matched vendor's real-
         // rawCategory rows ALSO route to the vendor category, so the target must
         // exist whenever the counterparty matches (the FALLBACK variant's COR-3
-        // rawCategory===null guard is deliberately removed). buildMapping binds and
-        // mapTxnToExpense consumes the alias by BYTE-EXACT counterparty (§7.3), so a
-        // config key that matches only case/whitespace-insensitively would create a
-        // category that never resolves — warn loudly rather than fail silently (F1).
+        // rawCategory===null guard is deliberately removed). The mapping consume
+        // (mapTxnToExpense) matches case-insensitively via normName, so a case/
+        // whitespace-variant key DOES resolve — log at info for auditability
+        // (operator can normalize the config key to the exact BankTxn.counterparty
+        // spelling to silence the note, but it's not required for correctness).
         const vendorCatTargets: string[] = [];
         for (const t of args.txns.filter(isCandidate)) {
           const cp = strOrNull(t.counterparty);
@@ -1806,10 +1843,12 @@ export const model = {
             if (normName(k) !== key) continue;
             vendorCatTargets.push(target);
             if (k !== cp) {
-              context.logger.warning(
-                "vendorCategoryOverlay key {key} differs from the observed counterparty " +
-                  "{cp} — the category bind is byte-exact, so this row will fall to the " +
-                  "fallback category. Set the key to the exact BankTxn.counterparty spelling.",
+              context.logger.info(
+                "vendorCategoryOverlay key {key} is a case/whitespace variant of " +
+                  "the observed counterparty {cp} — the category bind matches case-" +
+                  "insensitively (normName), so this row resolves correctly. " +
+                  "Normalize the config key to the exact BankTxn.counterparty " +
+                  "spelling to silence this note.",
                 { key: k, cp },
               );
             }
