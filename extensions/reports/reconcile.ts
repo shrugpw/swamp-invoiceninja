@@ -265,9 +265,31 @@ export const report = {
     const gap: BankTxn[] = [];
     const mismatch: Array<{ txn: BankTxn; recordedAmount: number | null }> = [];
     let matched = 0;
+    let deletedReclassified = 0; // REC-DEL: 'skip' rows absent from the live snapshot
     for (const t of candidates) {
       const rec = recorded.get(t.id);
       if (!rec) {
+        gap.push(t);
+        continue;
+      }
+      // REC-DEL: `recorded` is the expenseSync WRITE LOG, not live IN state. An
+      // idempotent 'skip' asserts the expense ALREADY exists in IN — but if a live
+      // listExpenses snapshot is present and its notDeleted key-set
+      // (`inExpenseKeyCounts`, built at :250-258) does NOT contain this key, the
+      // expense was soft-deleted in IN after it was synced. Presence-in-IN is
+      // exactly what 'recorded' is meant to assert, so treat it as a GAP (needs
+      // re-creating), not matched. Runs BEFORE the amount check (a deleted expense
+      // is a gap regardless of amount). Restricted to 'skip': a 'created' row is
+      // THIS run's own write and is authoritative regardless of whether the
+      // snapshot step ran before or after upsertExpenses (the REC-3 ordering
+      // hazard) — only a pre-existing ('skip') expense can be deleted out from
+      // under us. `recorded` collapses a key to 'created' if ANY row created it
+      // (:200), so a key created this run is never subject to this check.
+      if (
+        sawExpensesSnapshot && rec.action === "skip" &&
+        !inExpenseKeyCounts.has(t.id)
+      ) {
+        deletedReclassified++;
         gap.push(t);
         continue;
       }
@@ -372,6 +394,14 @@ export const report = {
       notes.push(
         "Duplicate backstop ran against `expenseSync` created-rows only — add a " +
           "`listExpenses` step for an authoritative `custom_value1` duplicate check.",
+      );
+    }
+    if (deletedReclassified > 0) {
+      notes.push(
+        `${deletedReclassified} expense(s) previously synced were **absent from ` +
+          "the live Invoice Ninja snapshot** (soft-deleted in IN after sync) — " +
+          "reclassified from matched to **gap** and listed above; re-run the write " +
+          "path to re-create them (REC-DEL).",
       );
     }
     if (transfers.length > 0) {
@@ -505,6 +535,7 @@ export const report = {
         caughtUp,
         candidateDebits: candidates.length,
         matched,
+        deletedReclassified,
         dryRun: anyDryRun,
         sawExpenseSync,
         sawBankTxns,

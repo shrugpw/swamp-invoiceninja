@@ -384,6 +384,106 @@ Deno.test("a soft-deleted IN expense is not counted toward the duplicate backsto
   assertEquals(out.json.caughtUp, true);
 });
 
+Deno.test("REC-DEL: a 'skip' whose only IN expense was soft-deleted is a GAP, not matched", async () => {
+  // `recorded` is the write LOG — a 'skip' asserts the expense ALREADY existed in
+  // IN. But the live snapshot shows the key's only expense is soft-deleted, so it
+  // is no longer recorded → reclassify matched→gap (fixes the false caughtUp).
+  const out = await run([
+    { name: "transactions", bytes: snapshot([bt({ id: "t1", amount: 100 })]) },
+    {
+      name: "expenseSync",
+      bytes: expenseSync([
+        syncRow({ dedupKey: "t1", action: "skip", amount: 100 }),
+      ]),
+    },
+    {
+      name: "expenses",
+      bytes: snapshot([inExpense("t1", "e-dead", { isDeleted: true })]),
+    },
+  ]);
+  assertEquals(out.json.matched, 0);
+  assertEquals(out.json.gap.count, 1);
+  assertEquals(out.json.deletedReclassified, 1);
+  assertEquals(out.json.caughtUp, false);
+  assertEquals(out.markdown.includes("soft-deleted in IN after sync"), true);
+});
+
+Deno.test("REC-DEL: a 'created' row stays matched even if absent from the snapshot (ordering-safe)", async () => {
+  // A listExpenses snapshot ordered BEFORE upsertExpenses lacks this run's fresh
+  // create. 'created' is this run's OWN write → authoritative regardless of
+  // ordering; only 'skip' rows are cross-checked. Never a false gap.
+  const out = await run([
+    { name: "transactions", bytes: snapshot([bt({ id: "t1", amount: 100 })]) },
+    {
+      name: "expenseSync",
+      bytes: expenseSync([
+        syncRow({ dedupKey: "t1", action: "created", amount: 100 }),
+      ]),
+    },
+    { name: "expenses", bytes: snapshot([inExpense("zzz", "e-other")]) }, // t1 absent
+  ]);
+  assertEquals(out.json.matched, 1);
+  assertEquals(out.json.gap.count, 0);
+  assertEquals(out.json.deletedReclassified, 0);
+  assertEquals(out.json.caughtUp, true);
+});
+
+Deno.test("REC-DEL: with no live expenses snapshot, a 'skip' stays matched (back-compat)", async () => {
+  // sawExpensesSnapshot=false ⇒ cross-check is inert ⇒ byte-identical to pre-fix.
+  const out = await run([
+    { name: "transactions", bytes: snapshot([bt({ id: "t1", amount: 100 })]) },
+    {
+      name: "expenseSync",
+      bytes: expenseSync([
+        syncRow({ dedupKey: "t1", action: "skip", amount: 100 }),
+      ]),
+    },
+  ]);
+  assertEquals(out.json.matched, 1);
+  assertEquals(out.json.deletedReclassified, 0);
+  assertEquals(out.json.caughtUp, true);
+});
+
+Deno.test("REC-DEL: a 'skip' still present in the live snapshot stays matched", async () => {
+  const out = await run([
+    { name: "transactions", bytes: snapshot([bt({ id: "t1", amount: 100 })]) },
+    {
+      name: "expenseSync",
+      bytes: expenseSync([
+        syncRow({ dedupKey: "t1", action: "skip", amount: 100 }),
+      ]),
+    },
+    { name: "expenses", bytes: snapshot([inExpense("t1", "e-live")]) },
+  ]);
+  assertEquals(out.json.matched, 1);
+  assertEquals(out.json.deletedReclassified, 0);
+  assertEquals(out.json.caughtUp, true);
+});
+
+Deno.test("REC-DEL: a 'skip' with both a live and a deleted IN expense stays matched", async () => {
+  // Only one of the two IN rows for the key is deleted; a live one remains, so the
+  // expense IS still recorded → matched, not reclassified.
+  const out = await run([
+    { name: "transactions", bytes: snapshot([bt({ id: "t1", amount: 100 })]) },
+    {
+      name: "expenseSync",
+      bytes: expenseSync([
+        syncRow({ dedupKey: "t1", action: "skip", amount: 100 }),
+      ]),
+    },
+    {
+      name: "expenses",
+      bytes: snapshot([
+        inExpense("t1", "e-live"),
+        inExpense("t1", "e-dead", { isDeleted: true }),
+      ]),
+    },
+  ]);
+  assertEquals(out.json.matched, 1);
+  assertEquals(out.json.deletedReclassified, 0);
+  assertEquals(out.json.caughtUp, true);
+});
+
 Deno.test("duplicate falls back to expenseSync 'created' rows only when no expenses snapshot", async () => {
   const out = await run([
     { name: "transactions", bytes: snapshot([bt({ id: "t1", amount: 100 })]) },

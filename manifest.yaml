@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@shrug/invoiceninja"
-version: "2026.07.21.1"
+version: "2026.09.22.1"
 description: |
   Invoice Ninja v5 (`/api/v1`) model — read-side snapshots (invoices, payments,
   expenses, vendors, expense categories) plus an idempotent, gated write path
@@ -12,18 +12,42 @@ description: |
   ## Methods
 
   - **Read** — `listInvoices`, `getInvoice`, `listPayments`, `listExpenses`,
-    `expenseCategories`, `vendors`. All paginate to completion.
+    `expenseCategories`, `vendors`, `listClients` (lean id/number/name
+    discovery) / `getClients` (by-id batch fan-out, full PII),
+    `listProjects` / `getProject`, `listTasks` / `getTask`,
+    `getCompanySettings` (GET /companies/{id}: custom-field labels +
+    currency/date-format ids). All list reads
+    paginate to completion. The `clients`/`clientList` snapshots are short-lived
+    (`clientSnapshotLifetime`, default `1h`), `gc=1`, and PII-sensitive.
   - **Write** (gated behind `dryRun`, default `true`) — `upsertExpenses`
     (check-then-create per BankTxn, dedup on `custom_value1`),
     `upsertVendors` / `upsertExpenseCategories` (auto-create reference data
     for candidate transactions), `buildMapping` (pure derive of the frozen
-    vendor/category `Mapping`).
+    vendor/category `Mapping`; under `dryRun` it also projects would-create
+    vendor/category names onto a sentinel id so an all-dry-run preview
+    resolves them instead of reporting a phantom unmatched vendor/category),
+    `upsertInvoices` (check-then-create invoices, dedup on `number`, full
+    product/service line items, draft-only — never emails/sends),
+    `invoiceTasks` (create ONE draft invoice from a set of tasks the way IN's
+    UI does — task-linked service lines with precise hours + `task_id`, dedup
+    on `number`, read-back confirms each task's `invoice_id` flipped, draft-only
+    — never emails/sends),
+    `upsertClients` / `upsertProjects` / `upsertTasks` (check-then-create,
+    dedup on `number`), the stateful task timer `startTask` / `stopTask`
+    (idempotent `PUT /tasks/{id}` rewriting `time_log`), and
+    `reconcileCompanySettings` (declarative, dry-by-default reconcile of
+    company custom-field labels + currency/date-format ids; strict relabel-only
+    (an empty live slot is never populated); on `dryRun=false` it round-trips
+    the FULL live `settings`/`custom_fields` JSON columns via
+    `PUT /companies/{id}`, mutating only changed keys, because IN REPLACES those
+    columns wholesale while MERGING omitted top-level company columns).
 
   ## Dedup contract
 
   Bank txn id → Invoice Ninja `custom_value1` — the only field both writable
-  and `?filter=`-searchable. Check-then-create; no upsert; single-writer
-  fan-out.
+  and `?filter=`-searchable — for expenses; the invoice `number` (unique and
+  `?filter=`-searchable) for invoices. Check-then-create; no upsert;
+  single-writer fan-out.
 
   ## Curated overlays
 
@@ -48,6 +72,9 @@ reports:
   - ar_aging.ts
   - expense_summary.ts
   - reconcile.ts
+  - finops_review.ts
+  - snapshot.ts
+  - snapshot_drift.ts
 
 # Empty platforms == universal. Talks HTTPS to the IN REST API via fetch(); no
 # host binaries are shelled out, so it runs anywhere.

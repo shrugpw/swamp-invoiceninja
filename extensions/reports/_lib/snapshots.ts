@@ -39,6 +39,13 @@ export interface ReportCtx {
   executionStatus: "succeeded" | "failed";
   /** Resolved model global arguments — optional report-period keys read here. */
   globalArgs?: Record<string, unknown>;
+  /**
+   * Args of the method that triggered this (method/model-scope) report. The
+   * framework's ModelReportContext provides these; the local type had
+   * under-declared them. A model-scope report attached to getClients reads
+   * `methodArgs.scope` here to materialize the correctly-scoped snapshots.
+   */
+  methodArgs?: Record<string, unknown>;
 }
 
 /** The list-snapshot envelope every read method writes (`snapshotSchema`). */
