@@ -824,6 +824,63 @@ export function normalizeClientLean(
   };
 }
 
+// --- Client email DOMAINS (§7 lead-spam allowlist source) -------------------
+// The known-customer hard-pass (design/lead-spam-filter.md §7) needs the SET of
+// customer email DOMAINS, never a local part or full address. These helpers
+// extract the domain and nothing else; the full email is transient and is never
+// stored or logged. PURE + exported for direct unit testing.
+
+/**
+ * The lowercased DOMAIN of an email (text after the last `@`), or null when the
+ * value is absent or not a plausible domain. NEVER returns the local part.
+ * Rejects addresses with no local part, no domain, whitespace, or a domain that
+ * is not a dotted label sequence (so a malformed value never enters the
+ * allowlist). "A@Acme.COM" -> "acme.com"; "bare", "@x", "a@", "a b@x.io" -> null.
+ */
+export function emailDomainOf(email: string | null | undefined): string | null {
+  const s = (email ?? "").trim().toLowerCase();
+  const at = s.lastIndexOf("@");
+  if (at <= 0 || at === s.length - 1) return null; // need both a local part + a domain
+  if (/\s/.test(s)) return null;
+  const domain = s.slice(at + 1);
+  // Dotted label sequence only (at least one dot, non-empty labels).
+  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(domain)) return null;
+  return domain;
+}
+
+/**
+ * The DEDUPED, sorted set of contact email DOMAINS across normalized clients.
+ * Free-mail/blocklisted domains are NOT filtered here — the consumer (the
+ * lead-spam classifier) owns that policy; this reader stays single-purpose.
+ * Only domains leave this function — never a local part or a full address.
+ * PURE + exported.
+ */
+export function collectClientDomains(
+  clients: ReadonlyArray<{ contacts: ReadonlyArray<{ email: string | null }> }>,
+): string[] {
+  const set = new Set<string>();
+  for (const c of clients) {
+    for (const contact of c.contacts ?? []) {
+      const d = emailDomainOf(contact.email);
+      if (d) set.add(d);
+    }
+  }
+  return [...set].sort();
+}
+
+// The `clientDomains` resource (§7): domains ONLY, so — unlike `clients` and
+// `clientList` — NO field is sensitive (a bare domain carries no person
+// identity). Still short-lived + single-version for freshness.
+const ClientDomainsSchema = z.object({
+  scope: z.string(),
+  count: z.number().int().nonnegative(),
+  domains: z.array(z.string()).describe(
+    "Deduped, sorted client contact email DOMAINS (text after @, lowercased). " +
+      "Never a local part or full address.",
+  ),
+  retrievedAt: z.string(),
+});
+
 const SingleSchema = z.object({
   id: z.string().describe("Hashed IN id — never coerce to int"),
   raw: z.record(z.string(), z.unknown()),
@@ -4480,6 +4537,19 @@ export const model = {
       // Keep only the latest version — no client-name history.
       garbageCollection: 1,
     },
+    "clientDomains": {
+      description:
+        "Client email-DOMAIN snapshot (clientDomains, §7) — the deduped SET of " +
+        "customer contact email domains ONLY (no local part, no full address, no " +
+        "name/contact PII). Powers the lead-spam known-customer hard-pass. No " +
+        "field is sensitive (a bare domain carries no person identity). " +
+        "lifetime is a DEFAULT; clientDomains overrides per-write from " +
+        "cfg.clientSnapshotLifetime.",
+      schema: ClientDomainsSchema,
+      lifetime: "1h",
+      // Keep only the latest version.
+      garbageCollection: 1,
+    },
     "clientSync": {
       description:
         "One row per client processed by upsertClient (client-write path); dedup " +
@@ -5007,6 +5077,65 @@ export const model = {
             scope: "clients-list",
             count: items.length,
             items,
+            retrievedAt: new Date().toISOString(),
+          },
+          { lifetime: cfg.clientSnapshotLifetime },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    clientDomains: {
+      description:
+        "GET /clients?include=contacts (paginated) → clientDomains: the DEDUPED " +
+        "SET of client contact email DOMAINS (text after @, lowercased) ONLY. " +
+        "The local part and full address are extracted to a domain in-method and " +
+        "then DISCARDED — never stored, never logged. This is the lead-spam " +
+        "known-customer allowlist source (design/lead-spam-filter.md §7): it " +
+        "exposes domain-only, so a returning customer hard-passes the spam gate " +
+        "without any contact PII leaving IN. Free-mail domains are NOT filtered " +
+        "here (the consumer applies its blocklist). Short-lived " +
+        "(cfg.clientSnapshotLifetime), gc=1.",
+      arguments: z.object({
+        // Query param ONLY (never a path segment), so no charset gate — same as
+        // listClients' filter.
+        filter: z.string().optional().describe(
+          "IN ?filter= search term (name/number/email substring). Query param " +
+            "only, never a path segment.",
+        ),
+      }),
+      execute: async (
+        args: { filter?: string; _fetch?: FetchLike },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        // include=contacts IS required to read emails — but only the DOMAIN
+        // survives: emails are reduced to domains below and never written/logged.
+        const query: Array<[string, string]> = [["include", "contacts"]];
+        const filter = strOrNull(args.filter);
+        if (filter !== null) query.push(["filter", filter]);
+        context.logger.info("Collecting client email domains (§7 allowlist)");
+        const rows = await inFetchAll(
+          cfg,
+          "clients",
+          query,
+          args._fetch,
+          context.logger,
+        );
+        const clients = rows.map((r) => normalizeClient(r));
+        const domains = collectClientDomains(clients);
+        // Log the COUNT only — never the domains or emails themselves.
+        context.logger.info("{count} distinct client domain(s)", {
+          count: domains.length,
+        });
+        // Domain-only snapshot; override lifetime per-write from cfg (default
+        // "1h"); gc=1 (latest only) from the resource spec.
+        const handle = await context.writeResource(
+          "clientDomains",
+          "client-domains",
+          {
+            scope: "client-domains",
+            count: domains.length,
+            domains,
             retrievedAt: new Date().toISOString(),
           },
           { lifetime: cfg.clientSnapshotLifetime },

@@ -26,12 +26,14 @@ import {
   buildNameIndex,
   buildTaskLineItem,
   closeOpenPair,
+  collectClientDomains,
   computedInvoiceStatus,
   decideStart,
   decideStop,
   derivedExpenseStatus,
   distinctByNorm,
   DRYRUN_SENTINEL,
+  emailDomainOf,
   encodeCustomField,
   type FetchLike,
   flattenPaymentables,
@@ -4610,6 +4612,81 @@ Deno.test("listClients: the `clientList` resource is short-lived + single-versio
     scope: "clients-list",
     count: 1,
     items: [normalizeClientLean({ id: "cl1", number: "C1", name: "X" })],
+    retrievedAt: new Date().toISOString(),
+  });
+  assertEquals(parsed.success, true);
+});
+
+// (3b) clientDomains — §7 lead-spam allowlist source (DOMAIN-only) -----------
+Deno.test("emailDomainOf: returns the lowercased domain, NEVER the local part [CLI-30]", () => {
+  assertEquals(emailDomainOf("Ada@Fakecorp.EXAMPLE"), "fakecorp.example");
+  assertEquals(emailDomainOf("a@sub.acme.co.uk"), "sub.acme.co.uk");
+  // Rejected: no local part, no domain, no dot, embedded whitespace, blank/null.
+  assertEquals(emailDomainOf("@acme.com"), null);
+  assertEquals(emailDomainOf("ada@"), null);
+  assertEquals(emailDomainOf("ada"), null);
+  assertEquals(emailDomainOf("ada@localhost"), null);
+  assertEquals(emailDomainOf("a b@acme.com"), null);
+  assertEquals(emailDomainOf(null), null);
+  assertEquals(emailDomainOf("   "), null);
+});
+
+Deno.test("collectClientDomains: dedupes + sorts, drops invalids, free-mail INCLUDED, no local part [CLI-31]", () => {
+  const domains = collectClientDomains([
+    { contacts: [{ email: "a@Acme.com" }, { email: "b@acme.com" }] },
+    { contacts: [{ email: "c@gmail.com" }, { email: "bogus" }, { email: null }] },
+    { contacts: [] },
+  ]);
+  // One acme.com (deduped, case-folded), free-mail kept (consumer filters), sorted.
+  assertEquals(domains, ["acme.com", "gmail.com"]);
+  const blob = JSON.stringify(domains);
+  assertEquals(blob.includes("@"), false);
+  assertEquals(blob.includes("bogus"), false);
+});
+
+Deno.test("clientDomains: snapshots ONLY domains — no address/local part reaches the resource [CLI-32]", async () => {
+  const { f, calls } = pagedFetcher([[
+    rawClient(), // contact ada@fakecorp.example
+    rawClient({
+      id: "cl2",
+      number: "CUST-002",
+      name: "Beta LLC",
+      contacts: [
+        { id: "ct-2", first_name: "Bo", last_name: "B", email: "bo@beta.io" },
+        { id: "ct-3", first_name: "X", last_name: "Y", email: "x@fakecorp.example" },
+      ],
+    }),
+  ]]);
+  const { context, writes } = stubContext(CLIENT_CFG);
+  await model.methods.clientDomains.execute(
+    // deno-lint-ignore no-explicit-any
+    { _fetch: f } as any,
+    context,
+  );
+  const snap = writes.find((w) => w.spec === "clientDomains")!;
+  assertEquals(snap.name, "client-domains");
+  // Deduped across clients + contacts, sorted; domain-only.
+  assertEquals(snap.data.domains, ["beta.io", "fakecorp.example"]);
+  assertEquals(snap.data.count, 2);
+  // PII GUARD: the full serialized snapshot carries NO local part / address.
+  const blob = JSON.stringify(snap.data);
+  assertEquals(blob.includes("ada"), false);
+  assertEquals(blob.includes("bo@"), false);
+  assertEquals(blob.includes("@fakecorp"), false);
+  // lifetime override flows from cfg.clientSnapshotLifetime.
+  assertEquals(snap.overrides?.lifetime, "24h");
+  // include=contacts IS requested (emails read transiently, reduced to domains).
+  assertEquals(calls[0].url.includes("include=contacts"), true);
+});
+
+Deno.test("clientDomains: the `clientDomains` resource is short-lived, single-version, schema-valid [CLI-33]", () => {
+  const spec = model.resources.clientDomains;
+  assertEquals(spec.lifetime, "1h");
+  assertEquals(spec.garbageCollection, 1);
+  const parsed = spec.schema.safeParse({
+    scope: "client-domains",
+    count: 1,
+    domains: ["acme.com"],
     retrievedAt: new Date().toISOString(),
   });
   assertEquals(parsed.success, true);
