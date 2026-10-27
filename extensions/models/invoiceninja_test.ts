@@ -4629,6 +4629,9 @@ Deno.test("emailDomainOf: returns the lowercased domain, NEVER the local part [C
   assertEquals(emailDomainOf("a b@acme.com"), null);
   assertEquals(emailDomainOf(null), null);
   assertEquals(emailDomainOf("   "), null);
+  // DOM-1: a multi-@ value must NOT resolve to the trailing domain (allowlist
+  // poisoning) — exactly one @ is required.
+  assertEquals(emailDomainOf("victim@real.com@attacker.com"), null);
 });
 
 Deno.test("collectClientDomains: dedupes + sorts, drops invalids, free-mail INCLUDED, no local part [CLI-31]", () => {
@@ -4657,7 +4660,7 @@ Deno.test("clientDomains: snapshots ONLY domains — no address/local part reach
       ],
     }),
   ]]);
-  const { context, writes } = stubContext(CLIENT_CFG);
+  const { context, writes, infos } = stubContext(CLIENT_CFG);
   await model.methods.clientDomains.execute(
     // deno-lint-ignore no-explicit-any
     { _fetch: f } as any,
@@ -4673,6 +4676,13 @@ Deno.test("clientDomains: snapshots ONLY domains — no address/local part reach
   assertEquals(blob.includes("ada"), false);
   assertEquals(blob.includes("bo@"), false);
   assertEquals(blob.includes("@fakecorp"), false);
+  // TEST-1: the logger carries the COUNT only — never a domain, email, or
+  // local part. Guards against a debug regression leaking PII to logs.
+  const logBlob = JSON.stringify(infos);
+  assertEquals(logBlob.includes("@"), false);
+  assertEquals(logBlob.includes("beta.io"), false);
+  assertEquals(logBlob.includes("fakecorp"), false);
+  assertEquals(infos.some((i) => i.data?.count === 2), true);
   // lifetime override flows from cfg.clientSnapshotLifetime.
   assertEquals(snap.overrides?.lifetime, "24h");
   // include=contacts IS requested (emails read transiently, reduced to domains).

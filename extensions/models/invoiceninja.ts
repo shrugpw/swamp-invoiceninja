@@ -839,11 +839,20 @@ export function normalizeClientLean(
  */
 export function emailDomainOf(email: string | null | undefined): string | null {
   const s = (email ?? "").trim().toLowerCase();
-  const at = s.lastIndexOf("@");
-  if (at <= 0 || at === s.length - 1) return null; // need both a local part + a domain
-  if (/\s/.test(s)) return null;
+  if (s === "" || /\s/.test(s)) return null;
+  // Require EXACTLY one '@'. Rejecting a multi-'@' value stops a crafted address
+  // like "victim@real.com@attacker.com" (lastIndexOf would have yielded
+  // attacker.com) from injecting an attacker-chosen domain into this
+  // security-relevant allowlist (review DOM-1).
+  const at = s.indexOf("@");
+  if (at <= 0 || at !== s.lastIndexOf("@") || at === s.length - 1) return null;
   const domain = s.slice(at + 1);
-  // Dotted label sequence only (at least one dot, non-empty labels).
+  // Dotted label sequence only (>=1 dot, non-empty ASCII / punycode labels).
+  // Deliberately STRICT (review CORR-1): a quoted local part containing spaces
+  // and a raw (non-punycode) IDN domain are rejected. A rare legitimate customer
+  // that trips this is a SAFE false-negative — it just isn't auto-allowlisted
+  // (the operator seed + dry-by-default quarantine review backstop it) — whereas
+  // a loose parser that over-accepts could poison the allowlist.
   if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(domain)) return null;
   return domain;
 }
@@ -5094,25 +5103,22 @@ export const model = {
         "exposes domain-only, so a returning customer hard-passes the spam gate " +
         "without any contact PII leaving IN. Free-mail domains are NOT filtered " +
         "here (the consumer applies its blocklist). Short-lived " +
-        "(cfg.clientSnapshotLifetime), gc=1.",
-      arguments: z.object({
-        // Query param ONLY (never a path segment), so no charset gate — same as
-        // listClients' filter.
-        filter: z.string().optional().describe(
-          "IN ?filter= search term (name/number/email substring). Query param " +
-            "only, never a path segment.",
-        ),
-      }),
+        "(cfg.clientSnapshotLifetime), gc=1. NO filter arg — the allowlist is " +
+        "completeness-critical, so this ALWAYS returns the full client set.",
+      // No `filter` argument (review SCOPE-1): this snapshot is the completeness-
+      // critical input to the lead-spam known-customer hard-pass, written under a
+      // constant name with gc=1. A filtered PARTIAL set written under that same
+      // name would be silently consumed as the full allowlist and could quarantine
+      // a real returning customer. So it always fetches every client.
+      arguments: z.object({}),
       execute: async (
-        args: { filter?: string; _fetch?: FetchLike },
+        args: { _fetch?: FetchLike },
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
         const cfg = context.globalArgs;
         // include=contacts IS required to read emails — but only the DOMAIN
         // survives: emails are reduced to domains below and never written/logged.
         const query: Array<[string, string]> = [["include", "contacts"]];
-        const filter = strOrNull(args.filter);
-        if (filter !== null) query.push(["filter", filter]);
         context.logger.info("Collecting client email domains (§7 allowlist)");
         const rows = await inFetchAll(
           cfg,
