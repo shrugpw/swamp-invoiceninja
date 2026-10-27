@@ -4231,7 +4231,7 @@ const TaskTimerSchema = z.object({
 
 export const model = {
   type: "@shrug/invoiceninja",
-  version: "2026.09.22.1",
+  version: "2026.10.27.2",
   description:
     "Invoice Ninja v5 (/api/v1): read invoices/payments/expenses + mapping " +
     "lists, an idempotent gated-write upsertExpense (dedup on custom_value1), a " +
@@ -4391,6 +4391,18 @@ export const model = {
         "finally-flush discipline. globalArguments is unchanged, so this is a " +
         "no-op attribute migration (existing instances upgrade cleanly with no " +
         "field changes).",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.27.2",
+      description:
+        "Add clientDomains: a read-only reader emitting the deduped " +
+        "SET of client contact email DOMAINS only (no local part / full address " +
+        "stored or logged) for the lead-spam known-customer allowlist " +
+        "(design/lead-spam-filter.md §7). Additive — new method + new " +
+        "clientDomains resource only; globalArguments unchanged, so this is a " +
+        "no-op attribute migration. (2026.10.27.1 published the code but omitted " +
+        "this behavior-version bump + upgrades entry; .2 restores the invariant.)",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
