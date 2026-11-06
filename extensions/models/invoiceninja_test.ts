@@ -6652,6 +6652,22 @@ Deno.test("ensureUser: an archived (archived_at set) email match is NOT 'exists'
   assertEquals(calls.some((c) => c.method === "POST"), true);
 });
 
+Deno.test("ensureUser: a LIVE email match with archived_at:0 IS 'exists' -> no duplicate create [EU-11]", async () => {
+  // Regression guard: IN returns archived_at:0 (NOT null) for a live,
+  // not-archived user. The dedup must treat 0 as LIVE (archived is strictly
+  // > 0) or it would create a duplicate on every call, defeating dedup.
+  const { f, calls } = userFetcher({
+    existing: [
+      { id: "user-live-9", email: "avery@example.com", archived_at: 0 },
+    ],
+    createdId: "user-dup",
+  });
+  const r = await ensureUser(CFG, { key: "avery@example.com" }, false, f);
+  assertEquals(r.action, "exists");
+  assertEquals(r.userId, "user-live-9");
+  assertEquals(calls.some((c) => c.method === "POST"), false);
+});
+
 Deno.test("mapTaskToBody: assignedUserId sets assigned_user_id; absent is unchanged [TAS-01]", () => {
   const withAssignee = mapTaskToBody(taskInput({ assignedUserId: "user-1" }));
   assertEquals(withAssignee.assigned_user_id, "user-1");

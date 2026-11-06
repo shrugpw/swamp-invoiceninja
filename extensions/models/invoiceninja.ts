@@ -2656,7 +2656,7 @@ export function mapUserToBody(
  *   1. in-run dedup via `seen` — IN's `?filter=` is NOT read-your-writes.
  *   2. PAGINATED dedup: scan every page of `?filter=key` (TRASH-INCLUSIVE --
  *      widens the GET so an in-run create stays visible across pagination)
- *      for a LIVE row (not `is_deleted`, not `archived_at`) whose `email`
+ *      for a LIVE row (not `is_deleted`, `archived_at` not > 0) whose `email`
  *      case-insensitively equals `key`. `exists`. A match that is trashed/
  *      archived/deleted does NOT count -- it is treated as ABSENT so a dead
  *      user id is never handed back as `exists` (falls through to create).
@@ -2703,13 +2703,18 @@ export async function ensureUser(
   // visible across pagination), but handing back a dead user's id as
   // "exists" would let upsertTasks silently assign a task to a gone user.
   // Treat a soft-deleted/archived match as ABSENT -- fall through to (3) and
-  // create a fresh, live user instead.
-  const match = existing.find(
-    (row) =>
-      (strOrNull(row.email) ?? "").toLowerCase() === keyLower &&
+  // create a fresh, live user instead. NOTE: IN returns `archived_at: 0`
+  // (not null) for a LIVE row, so "archived" is strictly `archived_at > 0`
+  // (mirroring this file's `archivedAt && archivedAt > 0 ? archivedAt : null`
+  // convention) -- a `=== null` check here would mis-treat EVERY live user as
+  // absent and create a duplicate on every call.
+  const match = existing.find((row) => {
+    const archivedAt = numOrNull(row.archived_at);
+    const archived = archivedAt !== null && archivedAt > 0;
+    return (strOrNull(row.email) ?? "").toLowerCase() === keyLower &&
       boolOrNull(row.is_deleted) !== true &&
-      numOrNull(row.archived_at) === null,
-  );
+      !archived;
+  });
   if (match) {
     const userId = strOrNull(match.id);
     seen?.set(key, userId);
