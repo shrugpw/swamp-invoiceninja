@@ -2654,8 +2654,12 @@ export function mapUserToBody(
  *      single-item write, not a fan-out row to skip-and-continue; the
  *      executor catches this and records an `error` audit row).
  *   1. in-run dedup via `seen` — IN's `?filter=` is NOT read-your-writes.
- *   2. PAGINATED dedup: scan every page of `?filter=key` (TRASH-INCLUSIVE) for
- *      a row whose `email` case-insensitively equals `key`. `exists`.
+ *   2. PAGINATED dedup: scan every page of `?filter=key` (TRASH-INCLUSIVE --
+ *      widens the GET so an in-run create stays visible across pagination)
+ *      for a LIVE row (not `is_deleted`, not `archived_at`) whose `email`
+ *      case-insensitively equals `key`. `exists`. A match that is trashed/
+ *      archived/deleted does NOT count -- it is treated as ABSENT so a dead
+ *      user id is never handed back as `exists` (falls through to create).
  *   3/4/5. build body; in dryRun return `would-create` (NO POST); else POST.
  * `seen` is populated on BOTH would-create and created.
  *
@@ -2694,8 +2698,17 @@ export async function ensureUser(
     logger,
   );
   const keyLower = key.toLowerCase();
+  // (2b) a trashed/archived/deleted row must NOT satisfy the dedup (F2): with
+  // _trashed=true WIDENS the GET on purpose (so an in-run create is still
+  // visible across pagination), but handing back a dead user's id as
+  // "exists" would let upsertTasks silently assign a task to a gone user.
+  // Treat a soft-deleted/archived match as ABSENT -- fall through to (3) and
+  // create a fresh, live user instead.
   const match = existing.find(
-    (row) => (strOrNull(row.email) ?? "").toLowerCase() === keyLower,
+    (row) =>
+      (strOrNull(row.email) ?? "").toLowerCase() === keyLower &&
+      boolOrNull(row.is_deleted) !== true &&
+      numOrNull(row.archived_at) === null,
   );
   if (match) {
     const userId = strOrNull(match.id);
@@ -4343,9 +4356,13 @@ export function decideStop(
 // IDEMPOTENT time-log write. Builds on the SAME PUT /tasks/{id} mechanism the
 // timer uses (there are no start/stop endpoints, STEP-0 finding above): read
 // the current time_log, merge-append a DETERMINISTIC [start,stop] pair for a
-// declared {date,hours}, and never clobber an existing pair (read-merge-
-// write). Reuses parseTimeLogEntries/isOpenEntry's TimeLogEntry shape so a
-// legacy/non-pair entry round-trips untouched, same discipline as the timer.
+// declared {date,hours}, merge-appending onto whatever time_log it just read
+// (read-merge-write). This minimizes but does NOT eliminate a clobber window:
+// IN has no atomic append / If-Match, so a concurrent caller or a
+// simultaneous IN-UI edit landing between the GET and the PUT can still be
+// overwritten -- not safe for concurrent callers. Reuses
+// parseTimeLogEntries/isOpenEntry's TimeLogEntry shape so a legacy/non-pair
+// entry round-trips untouched, same discipline as the timer.
 // ---------------------------------------------------------------------------
 
 /** Strict `date` arg format for {@link buildLoggedPair}/logTaskTime. */
@@ -8363,9 +8380,15 @@ export const model = {
         "pair for a declared {date (YYYY-MM-DD), hours}, then PUT /tasks/{id} " +
         "— the SAME PUT the task timer uses (IN has no start/stop endpoints). " +
         "Idempotent: re-applying the same {task,date,hours} is a no-op " +
-        "(action:'skipped-duplicate', no PUT) and never clobbers a pre-" +
-        "existing pair (read-merge-write). dryRun (default true) returns the " +
-        "would-be outcome and does NOT PUT. → timeLogSync (no PII).",
+        "(action:'skipped-duplicate', no PUT) -- the dedup key is {task,date," +
+        "hours} ONLY, so re-applying with a different `note` against an " +
+        "already-logged {task,date,hours} silently drops the new note (by " +
+        "design: note is not part of the identity tuple). The GET-then-PUT " +
+        "merge minimizes but does NOT eliminate a read-merge-write race " +
+        "(IN has no atomic append / If-Match): it is not safe against a " +
+        "concurrent caller or a simultaneous IN-UI edit to the same task's " +
+        "time_log. dryRun (default true) returns the would-be outcome and " +
+        "does NOT PUT. -> timeLogSync (no PII).",
       arguments: z.object({
         taskId: z.string().regex(
           /^[A-Za-z0-9]+$/,
@@ -8408,7 +8431,13 @@ export const model = {
         "against the user's `email`, case-insensitively; `email` defaults to " +
         "`key` when omitted). dryRun (default true) returns 'would-create' " +
         "and does NOT POST; dryRun=false POSTs /users when absent. Returns " +
-        "the resolved user id. → userSync (key/userId/action only).",
+        "the resolved user id. -> userSync (key/userId/action only), a " +
+        "FIXED resource name -- unlike the fan-out syncScope pattern used " +
+        "elsewhere, ensureUser has NO scope argument: `key` is typically an " +
+        "email, and interpolating a caller-supplied scope into the resource " +
+        "NAME would risk leaking it un-vaulted into a durable, CEL-" +
+        "addressable identifier (the `key` field's own .meta(sensitive) does " +
+        "NOT cover the resource name).",
       arguments: z.object({
         key: z.string().min(1).describe(
           "Stable dedup identifier — typically the user's email.",
@@ -8422,11 +8451,6 @@ export const model = {
         dryRun: z.boolean().optional().describe(
           "Overrides cfg.dryRun; default cfg.dryRun (true) → no POST.",
         ),
-        syncScope: z.string().min(1).optional().describe(
-          "Caller scope key; names userSync--<scope> (absent → bare " +
-            "'userSync'). Use a non-PII label (e.g. an employee code) — " +
-            "mirrors upsertTasks/upsertInvoices' syncScope.",
-        ),
       }),
       execute: async (
         args: {
@@ -8435,7 +8459,6 @@ export const model = {
           lastName?: string;
           email?: string;
           dryRun?: boolean;
-          syncScope?: string;
           _fetch?: FetchLike;
         },
         context: ExecuteContext,
@@ -8465,10 +8488,10 @@ export const model = {
           context.logger.warning("ensureUser failed");
           reason = e instanceof Error ? e.message : String(e);
         }
-        const name = args.syncScope
-          ? `userSync--${args.syncScope}`
-          : "userSync";
-        const handle = await context.writeResource("userSync", name, {
+        // FIXED resource name -- see F1 in the method description: ensureUser
+        // deliberately has no caller-scope arg, so nothing caller-supplied
+        // can land in this name (unlike userSync--<scope> elsewhere).
+        const handle = await context.writeResource("userSync", "userSync", {
           key: args.key,
           userId,
           action,

@@ -6603,7 +6603,11 @@ Deno.test("ensureUser method: a blank key is caught -> error row, never a reject
   );
 });
 
-Deno.test("ensureUser method: syncScope names userSync--<scope> [EU-08]", async () => {
+Deno.test("ensureUser method: resource name is FIXED userSync, even if a caller passes a scope-like arg [EU-08]", async () => {
+  // F1: ensureUser has NO syncScope -- a caller passing one (e.g. a stale
+  // integration still shaped like the other upsert* methods) must NOT have
+  // it interpolated into the resource name, since `key` is often an email
+  // and that would leak it un-vaulted into a durable CEL-addressable name.
   const { f } = userFetcher();
   const { context, writes } = stubContext();
   await model.methods.ensureUser.execute(
@@ -6616,7 +6620,36 @@ Deno.test("ensureUser method: syncScope names userSync--<scope> [EU-08]", async 
     } as any,
     context,
   );
-  assertEquals(writes[0].name, "userSync--w2-employee");
+  assertEquals(writes[0].name, "userSync");
+});
+
+Deno.test("ensureUser: a trashed (is_deleted) email match is NOT 'exists' -> creates a new live user [EU-09]", async () => {
+  // F2: with_trashed=true widens the GET, but a soft-deleted match must be
+  // treated as ABSENT -- otherwise upsertTasks could silently assign a task
+  // to a dead user id.
+  const { f, calls } = userFetcher({
+    existing: [
+      { id: "user-dead", email: "avery@example.com", is_deleted: true },
+    ],
+    createdId: "user-live",
+  });
+  const r = await ensureUser(CFG, { key: "avery@example.com" }, false, f);
+  assertEquals(r.action, "created");
+  assertEquals(r.userId, "user-live");
+  assertEquals(calls.some((c) => c.method === "POST"), true);
+});
+
+Deno.test("ensureUser: an archived (archived_at set) email match is NOT 'exists' -> creates a new live user [EU-10]", async () => {
+  const { f, calls } = userFetcher({
+    existing: [
+      { id: "user-archived", email: "avery@example.com", archived_at: 123 },
+    ],
+    createdId: "user-live-2",
+  });
+  const r = await ensureUser(CFG, { key: "avery@example.com" }, false, f);
+  assertEquals(r.action, "created");
+  assertEquals(r.userId, "user-live-2");
+  assertEquals(calls.some((c) => c.method === "POST"), true);
 });
 
 Deno.test("mapTaskToBody: assignedUserId sets assigned_user_id; absent is unchanged [TAS-01]", () => {
