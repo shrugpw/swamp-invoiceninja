@@ -2478,13 +2478,15 @@ export interface TaskUpsertResult {
 
 /**
  * Build the POST `/tasks` body from a raw task input (PURE, unit-tested).
- * `number` is the caller-assigned dedup key. Optional `client_id`/`project_id`
- * are included only when present (and only after the charset gate in
- * {@link upsertTask} has validated them). NEVER sets `time_log` — timing is the
- * timer surface's job, kept orthogonal to create.
+ * `number` is the caller-assigned dedup key. Optional `client_id`/`project_id`/
+ * `assigned_user_id` are included only when present (and only after the
+ * charset gate in {@link upsertTask} has validated them). NEVER sets
+ * `time_log` — timing is the timer surface's job, kept orthogonal to create.
  *
  * @param task A raw task input (§3): {number, description, clientId?,
- *   projectId?, rate?}.
+ *   projectId?, rate?, assignedUserId?}. `assignedUserId` is ADDITIVE
+ *   (design/specs/in-task-time-assignee.spec.md #3) — absent ⇒ no
+ *   `assigned_user_id` key at all, byte-identical to the pre-existing body.
  */
 export function mapTaskToBody(
   task: Record<string, unknown>,
@@ -2501,9 +2503,11 @@ export function mapTaskToBody(
   const clientId = strOrNull(task.clientId);
   const projectId = strOrNull(task.projectId);
   const rate = numOrNull(task.rate);
+  const assignedUserId = strOrNull(task.assignedUserId);
   if (clientId !== null) body.client_id = clientId;
   if (projectId !== null) body.project_id = projectId;
   if (rate !== null) body.rate = rate;
+  if (assignedUserId !== null) body.assigned_user_id = assignedUserId;
   return body;
 }
 
@@ -2513,10 +2517,10 @@ export function mapTaskToBody(
  * mirrors {@link upsertInvoice}:
  *   0. blank-key guard — never call `?filter=` with `""` (a blank/whitespace-only
  *      number would exact-match every other blank-number row). `blank-dedup-key`.
- *   1. VALIDATION GATE — any supplied `clientId`/`projectId` must match the IN
- *      hashid charset (`/^[A-Za-z0-9]+$/`); a malformed id (a full-account token
- *      makes it dangerous) rejects the task. A non-finite supplied `rate` is
- *      also invalid. `invalid`.
+ *   1. VALIDATION GATE — any supplied `clientId`/`projectId`/`assignedUserId`
+ *      must match the IN hashid charset (`/^[A-Za-z0-9]+$/`); a malformed id
+ *      (a full-account token makes it dangerous) rejects the task. A
+ *      non-finite supplied `rate` is also invalid. `invalid`.
  *   2. in-run dedup via `seen` — IN's `?filter=` is NOT read-your-writes.
  *   3. PAGINATED dedup: scan every page of `?filter=number` (TRASH-INCLUSIVE, so
  *      a soft-deleted task with this number still counts) for a row whose
@@ -2546,15 +2550,19 @@ export async function upsertTask(
   }
   // (1) validation gate — charset-validate any supplied id BEFORE it reaches a
   // POST body (design §3 / cross-cutting invariant), and reject a non-finite
-  // rate. Absent ids/rate are allowed (all optional on a task).
+  // rate. Absent ids/rate are allowed (all optional on a task). assignedUserId
+  // (design/specs/in-task-time-assignee.spec.md #3) is ADDITIVE and gated the
+  // same way as clientId/projectId.
   const clientId = strOrNull(task.clientId);
   const projectId = strOrNull(task.projectId);
+  const assignedUserId = strOrNull(task.assignedUserId);
   const rateProvided = task.rate !== undefined && task.rate !== null &&
     task.rate !== "";
   const rate = numOrNull(task.rate);
   if (
     (clientId !== null && !TASK_ID_CHARSET.test(clientId)) ||
     (projectId !== null && !TASK_ID_CHARSET.test(projectId)) ||
+    (assignedUserId !== null && !TASK_ID_CHARSET.test(assignedUserId)) ||
     (rateProvided && rate === null)
   ) {
     return { action: "skip", reason: "invalid", taskId: null };
@@ -2594,6 +2602,119 @@ export async function upsertTask(
   const data = (json.data ?? {}) as Record<string, unknown>;
   seen?.add(number);
   return { action: "created", taskId: strOrNull(data.id) };
+}
+
+// ---------------------------------------------------------------------------
+// Users-write path (design/specs/in-task-time-assignee.spec.md #2). ADDITIVE —
+// check-then-create ONE IN User, idempotent on a caller-supplied stable `key`
+// (the spec allows `key` to BE an email or a separate stable identifier; IN
+// has no custom_value1-style field on Users, so the dedup check matches a
+// user's `email` against `key` directly — the practical contract is that
+// `key` is normally the email). Mirrors upsertClient's discipline (blank-key
+// guard → in-run dedup → paginated exact-match dedup → dryRun would-create →
+// live POST) but is a SINGLE check-then-create (not a fan-out over an array):
+// one assignee is ensured at a time, same granularity as startTask/stopTask.
+// ---------------------------------------------------------------------------
+
+/** The result of a single {@link ensureUser}. */
+export interface UserEnsureResult {
+  action: "exists" | "would-create" | "created";
+  userId: string | null;
+}
+
+/**
+ * Build the POST `/users` body from a raw EnsureUserInput (PURE, unit-tested).
+ * `email` defaults to `key` when the caller omits a separate `email` (the
+ * common case: `key` IS the email). `first_name`/`last_name` are included
+ * only when present. NEVER sets a password or any role/permission field —
+ * provisioning least-privilege access is out of scope here.
+ *
+ * @param input A raw EnsureUserInput: {key, firstName?, lastName?, email?}.
+ */
+export function mapUserToBody(
+  input: Record<string, unknown>,
+): Record<string, unknown> {
+  const key = strOrNull(input.key);
+  const email = strOrNull(input.email) ?? key;
+  const body: Record<string, unknown> = {
+    email: email ?? "",
+  };
+  const firstName = strOrNull(input.firstName);
+  const lastName = strOrNull(input.lastName);
+  if (firstName !== null) body.first_name = firstName;
+  if (lastName !== null) body.last_name = lastName;
+  return body;
+}
+
+/**
+ * Check-then-create ONE IN User, idempotent on `key` (matched against the
+ * user's `email`, case-insensitively). Never mutates. Order mirrors
+ * {@link upsertClient}:
+ *   0. blank-key guard — a blank/whitespace-only `key` THROWS (this is a
+ *      single-item write, not a fan-out row to skip-and-continue; the
+ *      executor catches this and records an `error` audit row).
+ *   1. in-run dedup via `seen` — IN's `?filter=` is NOT read-your-writes.
+ *   2. PAGINATED dedup: scan every page of `?filter=key` (TRASH-INCLUSIVE) for
+ *      a row whose `email` case-insensitively equals `key`. `exists`.
+ *   3/4/5. build body; in dryRun return `would-create` (NO POST); else POST.
+ * `seen` is populated on BOTH would-create and created.
+ *
+ * @param cfg Resolved config.
+ * @param input A raw EnsureUserInput.
+ * @param dryRun When true, never POSTs.
+ * @param doFetch Fetch implementation (injected in tests).
+ * @param seen In-run map of key → userId already would-created/created (null
+ *   while pending in dry-run) this batch.
+ * @param logger Optional logger.
+ */
+export async function ensureUser(
+  cfg: GlobalArgs,
+  input: Record<string, unknown>,
+  dryRun: boolean,
+  doFetch?: FetchLike,
+  seen?: Map<string, string | null>,
+  logger?: MethodLogger,
+): Promise<UserEnsureResult> {
+  const key = strOrNull(input.key);
+  // (0) blank-key guard — must precede any `?filter=` call.
+  if (key === null || key.trim() === "") {
+    throw new Error("ensureUser: key must be a non-blank string");
+  }
+  // (1) in-run dedup.
+  if (seen?.has(key)) {
+    return { action: "exists", userId: seen.get(key) ?? null };
+  }
+  // (2) paginated exact-match dedup, TRASH-INCLUSIVE, case-insensitive email
+  // (email addresses are case-insensitive by convention).
+  const existing = await inFetchAll(
+    cfg,
+    "users",
+    [["filter", key], ["with_trashed", "true"]],
+    doFetch,
+    logger,
+  );
+  const keyLower = key.toLowerCase();
+  const match = existing.find(
+    (row) => (strOrNull(row.email) ?? "").toLowerCase() === keyLower,
+  );
+  if (match) {
+    const userId = strOrNull(match.id);
+    seen?.set(key, userId);
+    return { action: "exists", userId };
+  }
+  // (3) build body.
+  const body = mapUserToBody(input);
+  // (4) dry-run — no write.
+  if (dryRun) {
+    seen?.set(key, null);
+    return { action: "would-create", userId: null };
+  }
+  // (5) real create.
+  const json = await inFetch(cfg, "POST", "users", { body }, doFetch);
+  const data = (json.data ?? {}) as Record<string, unknown>;
+  const userId = strOrNull(data.id);
+  seen?.set(key, userId);
+  return { action: "created", userId };
 }
 
 // ---------------------------------------------------------------------------
@@ -4217,6 +4338,78 @@ export function decideStop(
   };
 }
 
+// ---------------------------------------------------------------------------
+// logTaskTime (design/specs/in-task-time-assignee.spec.md #1) — declarative,
+// IDEMPOTENT time-log write. Builds on the SAME PUT /tasks/{id} mechanism the
+// timer uses (there are no start/stop endpoints, STEP-0 finding above): read
+// the current time_log, merge-append a DETERMINISTIC [start,stop] pair for a
+// declared {date,hours}, and never clobber an existing pair (read-merge-
+// write). Reuses parseTimeLogEntries/isOpenEntry's TimeLogEntry shape so a
+// legacy/non-pair entry round-trips untouched, same discipline as the timer.
+// ---------------------------------------------------------------------------
+
+/** Strict `date` arg format for {@link buildLoggedPair}/logTaskTime. */
+export const TIMELOG_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Build the deterministic `[start, stop]` (or `[start, stop, note]`) time_log
+ * pair for a declared `{date, hours}`. `start` is a FIXED 09:00:00 UTC anchor
+ * on `date` (NOT the caller's local timezone — chosen so the pair is
+ * reproducible across runs/environments without wall-clock flake, mirroring
+ * the injected-clock discipline elsewhere in this file); `stop` is
+ * `start + round(hours * 3600)`. PURE; throws on a malformed `date` (the
+ * method's zod schema + the executor's defense-in-depth check validate first
+ * — this is a second, redundant guard since the function is also exported for
+ * direct unit testing).
+ */
+export function buildLoggedPair(
+  date: string,
+  hours: number,
+  note?: string | null,
+): TimeLogEntry {
+  if (!TIMELOG_DATE_RE.test(date)) {
+    throw new Error(`logTaskTime: date "${date}" must be YYYY-MM-DD`);
+  }
+  const [y, m, d] = date.split("-").map(Number);
+  const start = Math.floor(Date.UTC(y, m - 1, d, 9, 0, 0) / 1000);
+  const stop = start + Math.round(hours * 3600);
+  const noteVal = strOrNull(note ?? null);
+  return noteVal !== null ? [start, stop, noteVal] : [start, stop];
+}
+
+/** The pure decision produced by {@link decideLogTime} (mirrors {@link TimerDecision}). */
+export interface LogTimeDecision {
+  action: "logged" | "skipped-duplicate";
+  /** The would-be `time_log` after the merge (same array when unchanged). */
+  newLog: TimeLogEntry[];
+  /** Whether a PUT is needed (false ⇒ idempotent no-op, never PUTs). */
+  changed: boolean;
+}
+
+/**
+ * Decide the outcome of a logTaskTime apply given the current parsed
+ * `time_log` and the deterministic `pair` ({@link buildLoggedPair}). An
+ * existing entry whose `[start, stop]` (its first two elements) EXACTLY
+ * match the pair's ⇒ idempotent no-op (`skipped-duplicate`, no change, no
+ * PUT) — re-applying the same {task,date,hours} never duplicates. Otherwise
+ * MERGE-append the pair (`logged`), PRESERVING every existing entry verbatim
+ * (read-merge-write; NEVER drops or reorders a pre-existing pair). PURE.
+ */
+export function decideLogTime(
+  log: TimeLogEntry[],
+  pair: TimeLogEntry,
+): LogTimeDecision {
+  const p = pair as [number, number, string?];
+  const dup = log.some((entry) => {
+    if (!Array.isArray(entry)) return false;
+    return numOrNull(entry[0]) === p[0] && numOrNull(entry[1]) === p[1];
+  });
+  if (dup) {
+    return { action: "skipped-duplicate", newLog: log, changed: false };
+  }
+  return { action: "logged", newLog: [...log, pair], changed: true };
+}
+
 /** The task-timer outcome resource (§4) — one row per startTask/stopTask flip. */
 const TaskTimerSchema = z.object({
   taskId: z.string(),
@@ -4226,6 +4419,44 @@ const TaskTimerSchema = z.object({
   // The would-be `time_log` after the flip (structured; entries are mixed
   // [start, stop, …]). On a dry run this is the state that WOULD be PUT.
   timeLog: z.array(z.array(z.unknown())),
+  at: z.string(),
+});
+
+// ADDITIVE (logTaskTime, design/specs/in-task-time-assignee.spec.md #1) — the
+// outcome of ONE logTaskTime apply. No PII: taskId/number/date/hours/action
+// only. The caller's optional `note` is NEVER persisted here — it lives only
+// inside the IN time_log entry itself (same treatment as every other free-
+// text field in this file, e.g. task `description`).
+const TimeLogSyncSchema = z.object({
+  taskId: z.string().nullable(),
+  number: z.string().nullable().describe(
+    "The caller's taskNumber, when that (not taskId) resolved the task.",
+  ),
+  date: z.string(),
+  hours: z.number(),
+  action: z.enum(["logged", "skipped-duplicate", "error"]),
+  reason: z.string().nullable().default(null).describe(
+    "Set only on an `error` row (not-found, invalid, or a GET/PUT that threw).",
+  ),
+  dryRun: z.boolean(),
+  at: z.string(),
+});
+
+// ADDITIVE (ensureUser, design/specs/in-task-time-assignee.spec.md #2) — the
+// outcome of ONE ensureUser call. `key` is the caller's dedup identifier —
+// per the spec this is explicitly carried (it is the method's own anchor,
+// same role `number`/`custom_value1` play for clients/tasks) but it MAY be an
+// email, so it is marked `.meta({ sensitive: true })` (same treatment as
+// ClientContactSchema.email) and NO other field (first/last name, a separate
+// `email` override) is ever recorded here.
+const UserSyncSchema = z.object({
+  key: z.string().meta({ sensitive: true }),
+  userId: z.string().nullable(),
+  action: z.enum(["exists", "would-create", "created", "error"]),
+  reason: z.string().nullable().default(null).describe(
+    "Set only on an `error` row (blank key or a GET/POST that threw).",
+  ),
+  dryRun: z.boolean(),
   at: z.string(),
 });
 
@@ -4730,6 +4961,27 @@ export const model = {
       schema: TaskTimerSchema,
       lifetime: "infinite",
       garbageCollection: 20,
+    },
+    "timeLogSync": {
+      description:
+        "Outcome of ONE logTaskTime apply (design/specs/in-task-time-" +
+        "assignee.spec.md #1) — taskId/number/date/hours/action only. No PII.",
+      schema: TimeLogSyncSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    "userSync": {
+      description:
+        "Outcome of ONE ensureUser call (design/specs/in-task-time-assignee." +
+        "spec.md #2) — key/userId/action only. `key` MAY be an email (it is " +
+        "the method's own dedup anchor) so it is field-sensitive; short-lived " +
+        "(1h, gc=1) like the other PII-adjacent snapshots (clients/clientList).",
+      schema: UserSyncSchema,
+      // Short + single-version, like `clients`/`clientList`: `key` may carry
+      // an email, so this resource gets the SAME PII-lifetime discipline, not
+      // the infinite/gc-20 treatment the PII-free *Sync audits use.
+      lifetime: "1h",
+      garbageCollection: 1,
     },
   },
   files: {
@@ -6817,12 +7069,16 @@ export const model = {
         "Check-then-create tasks for a TaskInput[] (dedup on `custom_value1`; " +
         "the caller's key goes there because IN auto-manages the task number). " +
         "Single-writer fan-out; dryRun default true; NEVER sets time_log " +
-        "(timing is the timer surface's job). → taskSync (+ taskSyncErrors for " +
+        "(timing is the timer surface's job). Optional assignedUserId sets " +
+        "assigned_user_id on create (design/specs/in-task-time-assignee.spec.md " +
+        "#3); absent ⇒ unchanged behavior. → taskSync (+ taskSyncErrors for " +
         "failed/rejected attempts).",
       arguments: z.object({
         tasks: z.array(z.record(z.string(), z.unknown())).describe(
           "TaskInput[]: {number (dedup key), description, clientId?, " +
-            "projectId?, rate?} (design/invoiceninja-entity-crud.md §3).",
+            "projectId?, rate?, assignedUserId?} (design/invoiceninja-entity-" +
+            "crud.md §3; assignedUserId is additive, design/specs/in-task-time-" +
+            "assignee.spec.md #3).",
         ),
         dryRun: z.boolean().optional().describe(
           "Overrides cfg.dryRun; default cfg.dryRun (true).",
@@ -8099,6 +8355,130 @@ export const model = {
         context: ExecuteContext,
       ): Promise<ExecuteResult> => runTaskTimer("stop", args, context),
     },
+    // --- logTaskTime (design/specs/in-task-time-assignee.spec.md #1) ---
+    logTaskTime: {
+      description:
+        "Resolve a task (taskId, or taskNumber → custom_value1), read its " +
+        "current time_log, and merge-append a deterministic [start,stop] " +
+        "pair for a declared {date (YYYY-MM-DD), hours}, then PUT /tasks/{id} " +
+        "— the SAME PUT the task timer uses (IN has no start/stop endpoints). " +
+        "Idempotent: re-applying the same {task,date,hours} is a no-op " +
+        "(action:'skipped-duplicate', no PUT) and never clobbers a pre-" +
+        "existing pair (read-merge-write). dryRun (default true) returns the " +
+        "would-be outcome and does NOT PUT. → timeLogSync (no PII).",
+      arguments: z.object({
+        taskId: z.string().regex(
+          /^[A-Za-z0-9]+$/,
+          "IN hashid must be alphanumeric (no path separators)",
+        ).optional(),
+        taskNumber: z.string().min(1).optional().describe(
+          "Resolves via custom_value1 (the task-write dedup key, §3) when " +
+            "taskId is absent. Matched against a LIVE task only.",
+        ),
+        date: z.string().regex(TIMELOG_DATE_RE, "must be YYYY-MM-DD"),
+        hours: z.number().positive(),
+        note: z.string().optional().describe(
+          "Stored only inside the IN time_log entry itself — NEVER persisted " +
+            "to timeLogSync.",
+        ),
+        dryRun: z.boolean().optional().describe(
+          "Overrides cfg.dryRun; default cfg.dryRun (true) → no PUT.",
+        ),
+      }).refine(
+        (v) => Boolean(v.taskId) || Boolean(v.taskNumber),
+        { message: "one of taskId or taskNumber is required" },
+      ),
+      execute: (
+        args: {
+          taskId?: string;
+          taskNumber?: string;
+          date: string;
+          hours: number;
+          note?: string;
+          dryRun?: boolean;
+          _fetch?: FetchLike;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => runLogTaskTime(args, context),
+    },
+    // --- ensureUser (design/specs/in-task-time-assignee.spec.md #2) ---
+    ensureUser: {
+      description:
+        "Check-then-create ONE IN User, idempotent on `key` (matched " +
+        "against the user's `email`, case-insensitively; `email` defaults to " +
+        "`key` when omitted). dryRun (default true) returns 'would-create' " +
+        "and does NOT POST; dryRun=false POSTs /users when absent. Returns " +
+        "the resolved user id. → userSync (key/userId/action only).",
+      arguments: z.object({
+        key: z.string().min(1).describe(
+          "Stable dedup identifier — typically the user's email.",
+        ),
+        firstName: z.string().optional(),
+        lastName: z.string().optional(),
+        email: z.string().optional().describe(
+          "Overrides `key` as the POSTed email when they differ; defaults " +
+            "to `key`.",
+        ),
+        dryRun: z.boolean().optional().describe(
+          "Overrides cfg.dryRun; default cfg.dryRun (true) → no POST.",
+        ),
+        syncScope: z.string().min(1).optional().describe(
+          "Caller scope key; names userSync--<scope> (absent → bare " +
+            "'userSync'). Use a non-PII label (e.g. an employee code) — " +
+            "mirrors upsertTasks/upsertInvoices' syncScope.",
+        ),
+      }),
+      execute: async (
+        args: {
+          key: string;
+          firstName?: string;
+          lastName?: string;
+          email?: string;
+          dryRun?: boolean;
+          syncScope?: string;
+          _fetch?: FetchLike;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const dryRun = args.dryRun ?? cfg.dryRun;
+        const now = () => new Date().toISOString();
+        let action: "exists" | "would-create" | "created" | "error" = "error";
+        let userId: string | null = null;
+        let reason: string | null = null;
+        try {
+          const r = await ensureUser(
+            cfg,
+            args,
+            dryRun,
+            args._fetch,
+            undefined,
+            context.logger,
+          );
+          action = r.action;
+          userId = r.userId;
+        } catch (e) {
+          // Single-item write: catch rather than reject, so the call always
+          // leaves a durable, queryable outcome (mirrors the fan-out writers'
+          // never-abort-silently discipline, scaled to one item). NEVER log
+          // the raw key — it may be an email.
+          context.logger.warning("ensureUser failed");
+          reason = e instanceof Error ? e.message : String(e);
+        }
+        const name = args.syncScope
+          ? `userSync--${args.syncScope}`
+          : "userSync";
+        const handle = await context.writeResource("userSync", name, {
+          key: args.key,
+          userId,
+          action,
+          reason,
+          dryRun,
+          at: now(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
   },
 };
 
@@ -8173,6 +8553,130 @@ async function runTaskTimer(
       dryRun,
       timeLog: decision.newLog,
       at: new Date().toISOString(),
+    },
+  );
+  return { dataHandles: [handle] };
+}
+
+/**
+ * Shared executor for logTaskTime (#1). Resolves the task (taskId directly,
+ * or taskNumber → custom_value1, TRASH-EXCLUSIVE — only a LIVE task may
+ * receive logged time), GETs its CURRENT state right before the merge
+ * (minimizing the TOCTOU window, the same discipline {@link runTaskTimer}
+ * uses), computes the deterministic pair via {@link buildLoggedPair},
+ * merge-decides via the PURE {@link decideLogTime}, and PUTs only when
+ * `changed` AND `dryRun` is false. logTaskTime is a single-item write, but —
+ * unlike startTask/stopTask, which simply throw on a bad id — a resolution or
+ * wire failure is CAUGHT and recorded as an `error` row on `timeLogSync`
+ * (never thrown past this boundary), because the spec's audit contract
+ * explicitly wants an `error` action to be queryable.
+ */
+async function runLogTaskTime(
+  args: {
+    taskId?: string;
+    taskNumber?: string;
+    date: string;
+    hours: number;
+    note?: string;
+    dryRun?: boolean;
+    _fetch?: FetchLike;
+  },
+  context: ExecuteContext,
+): Promise<ExecuteResult> {
+  const cfg = context.globalArgs;
+  const dryRun = args.dryRun ?? cfg.dryRun;
+  const now = () => new Date().toISOString();
+  let taskId: string | null = null;
+  let action: "logged" | "skipped-duplicate" | "error" = "error";
+  let reason: string | null = null;
+  try {
+    // Defense-in-depth: re-assert the guards even though zod already
+    // validates them at the schema boundary — tests (and any non-zod caller)
+    // reach execute directly.
+    if (args.taskId !== undefined && !TASK_ID_CHARSET.test(args.taskId)) {
+      throw new Error(
+        `logTaskTime: task id "${args.taskId}" must be alphanumeric ` +
+          "(no path separators)",
+      );
+    }
+    if (!TIMELOG_DATE_RE.test(args.date)) {
+      throw new Error(`logTaskTime: date "${args.date}" must be YYYY-MM-DD`);
+    }
+    if (!Number.isFinite(args.hours) || !(args.hours > 0)) {
+      throw new Error("logTaskTime: hours must be a positive finite number");
+    }
+
+    if (args.taskId !== undefined) {
+      taskId = args.taskId;
+    } else {
+      // Resolve by number → custom_value1, mirroring upsertTask's exact-match
+      // dedup (TRASH-EXCLUSIVE here — only a LIVE task can receive logged
+      // time, unlike the create-dedup check which is trash-inclusive).
+      const rows = await inFetchAll(
+        cfg,
+        "tasks",
+        [["filter", args.taskNumber!]],
+        args._fetch,
+        context.logger,
+      );
+      const match = rows.find(
+        (row) => strOrNull(row.custom_value1) === args.taskNumber,
+      );
+      if (!match) {
+        throw new Error(
+          `logTaskTime: no live task found for number "${args.taskNumber}"`,
+        );
+      }
+      const matchId = strOrNull(match.id);
+      // Defense-in-depth: a resolved id MUST still clear the path-safety
+      // charset before it is ever interpolated into a GET/PUT path, even
+      // though it came from IN's own response.
+      if (matchId === null || !TASK_ID_CHARSET.test(matchId)) {
+        throw new Error("logTaskTime: resolved task id is invalid");
+      }
+      taskId = matchId;
+    }
+
+    const json = await inFetch(cfg, "GET", `tasks/${taskId}`, {}, args._fetch);
+    const raw = (json.data ?? {}) as Record<string, unknown>;
+    const log = parseTimeLogEntries(raw.time_log);
+    const pair = buildLoggedPair(args.date, args.hours, args.note ?? null);
+    const decision = decideLogTime(log, pair);
+    action = decision.action;
+
+    if (decision.changed && !dryRun) {
+      // PUT the rewritten time_log as the JSON STRING IN returns/expects —
+      // the SAME mechanism runTaskTimer uses (there are no start/stop/log
+      // endpoints).
+      await inFetch(
+        cfg,
+        "PUT",
+        `tasks/${taskId}`,
+        { body: { time_log: JSON.stringify(decision.newLog) } },
+        args._fetch,
+      );
+    }
+    context.logger.info(
+      "logTaskTime {taskId}: {action} (dryRun={dryRun})",
+      { taskId, action, dryRun },
+    );
+  } catch (e) {
+    action = "error";
+    reason = e instanceof Error ? e.message : String(e);
+    context.logger.warning("logTaskTime failed: {reason}", { reason });
+  }
+  const handle = await context.writeResource(
+    "timeLogSync",
+    `timeLogSync:${taskId ?? args.taskNumber ?? "unresolved"}`,
+    {
+      taskId,
+      number: args.taskId !== undefined ? null : args.taskNumber ?? null,
+      date: args.date,
+      hours: args.hours,
+      action,
+      reason,
+      dryRun,
+      at: now(),
     },
   );
   return { dataHandles: [handle] };
