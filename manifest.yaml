@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@shrug/invoiceninja"
-version: "2026.10.27.2"
+version: "2026.11.07.1"
 description: |
   Invoice Ninja v5 (`/api/v1`) model — read-side snapshots (invoices, payments,
   expenses, vendors, expense categories) plus an idempotent, gated write path
@@ -41,6 +41,10 @@ description: |
     the FULL live `settings`/`custom_fields` JSON columns via
     `PUT /companies/{id}`, mutating only changed keys, because IN REPLACES those
     columns wholesale while MERGING omitted top-level company columns).
+    Also `logTaskTime` (gated, dedup-idempotent task time-log writer appending
+    `[start,stop]` pairs to a task's `time_log`), `ensureUser` (idempotent user
+    upsert/dedup by email, never storing or logging the address), and an
+    optional `assignedUserId` on `upsertTasks` to set a task's assignee.
 
   ## Dedup contract
 

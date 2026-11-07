@@ -4484,7 +4484,7 @@ const UserSyncSchema = z.object({
 
 export const model = {
   type: "@shrug/invoiceninja",
-  version: "2026.10.27.2",
+  version: "2026.11.07.1",
   description:
     "Invoice Ninja v5 (/api/v1): read invoices/payments/expenses + mapping " +
     "lists, an idempotent gated-write upsertExpense (dedup on custom_value1), a " +
@@ -4656,6 +4656,16 @@ export const model = {
         "clientDomains resource only; globalArguments unchanged, so this is a " +
         "no-op attribute migration. (2026.10.27.1 published the code but omitted " +
         "this behavior-version bump + upgrades entry; .2 restores the invariant.)",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.07.1",
+      description:
+        "Add logTaskTime (gated task time-log writer), ensureUser (idempotent " +
+        "user upsert/dedup), and an optional assignedUserId on upsertTasks. " +
+        "Additive -- new methods + timeLogSync/userSync resources only; " +
+        "globalArguments unchanged, so this is a no-op attribute migration " +
+        "(existing instances upgrade cleanly with no field changes).",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -8693,9 +8703,18 @@ async function runLogTaskTime(
     reason = e instanceof Error ? e.message : String(e);
     context.logger.warning("logTaskTime failed: {reason}", { reason });
   }
+  // The resource-name segment: prefer the resolved (charset-safe) taskId. When
+  // task resolution failed we fall back to the caller's raw taskNumber, which is
+  // unvalidated user input -- sanitize it to a safe charset so it cannot inject
+  // odd characters into (or collide across) resource names.
+  const nameSegment = taskId ??
+    (args.taskNumber != null
+      ? args.taskNumber.replace(/[^A-Za-z0-9._-]/g, "_")
+      : null) ??
+    "unresolved";
   const handle = await context.writeResource(
     "timeLogSync",
-    `timeLogSync:${taskId ?? args.taskNumber ?? "unresolved"}`,
+    `timeLogSync:${nameSegment}`,
     {
       taskId,
       number: args.taskId !== undefined ? null : args.taskNumber ?? null,
