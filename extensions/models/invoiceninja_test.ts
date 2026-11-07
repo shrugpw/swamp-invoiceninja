@@ -15,19 +15,21 @@
  *
  * @module
  */
-import { assertEquals, assertRejects } from "jsr:@std/assert@1";
+import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
 import {
   appendOpenPair,
   applyOverlay,
   applyPayment,
   boolOrNull,
   buildInvoiceIndex,
+  buildLoggedPair,
   buildMarkSentIndex,
   buildNameIndex,
   buildTaskLineItem,
   closeOpenPair,
   collectClientDomains,
   computedInvoiceStatus,
+  decideLogTime,
   decideStart,
   decideStop,
   derivedExpenseStatus,
@@ -35,6 +37,7 @@ import {
   DRYRUN_SENTINEL,
   emailDomainOf,
   encodeCustomField,
+  ensureUser,
   type FetchLike,
   flattenPaymentables,
   hasOpenTimeLogPair,
@@ -57,6 +60,7 @@ import {
   mapProjectToBody,
   mapTaskToBody,
   mapTxnToExpense,
+  mapUserToBody,
   model,
   normalizeClient,
   normalizeClientContact,
@@ -6187,6 +6191,526 @@ Deno.test("startTask: tolerates an empty/absent time_log (fresh task) → starte
   assertEquals(putCount(calls), 1);
   assertEquals(putTimeLog(calls), [[1_710_000_000, 0]]);
   assertEquals(writes[0].data.action, "started");
+});
+
+// ===========================================================================
+// logTaskTime (design/specs/in-task-time-assignee.spec.md #1) + ensureUser
+// (#2) + assignee-on-upsertTasks (#3). Depersonalized fixtures (Avery Kim /
+// Acme Collective) — no real names/emails/ids.
+// ===========================================================================
+
+/**
+ * A fake {@link FetchLike} for logTaskTime's taskNumber-resolution path: GET
+ * `tasks?filter=…` (the list/search call) returns `opts.listRows`; a single
+ * GET `tasks/{id}` returns `{id, time_log: opts.timeLog}`; any PUT succeeds.
+ */
+function logTimeFetcher(
+  opts: {
+    listRows?: Array<Record<string, unknown>>;
+    timeLog?: unknown;
+  } = {},
+): { f: FetchLike; calls: WFetchRec[] } {
+  const calls: WFetchRec[] = [];
+  const f: FetchLike = (url, init) => {
+    calls.push({
+      url,
+      method: init?.method,
+      headers: init?.headers,
+      body: init?.body,
+    });
+    const method = init?.method ?? "GET";
+    if (method === "PUT") {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () => Promise.resolve({ data: {} }),
+      });
+    }
+    const pathname = new URL(url).pathname;
+    if (pathname.endsWith("/tasks")) {
+      const rows = opts.listRows ?? [];
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () =>
+          Promise.resolve({
+            data: rows,
+            meta: { pagination: { current_page: 1, total_pages: 1 } },
+          }),
+      });
+    }
+    const id = pathname.split("/").pop();
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: () => Promise.resolve({ data: { id, time_log: opts.timeLog } }),
+    });
+  };
+  return { f, calls };
+}
+
+Deno.test("buildLoggedPair: deterministic [start,stop] anchored at 09:00 UTC on `date` [TLT-01]", () => {
+  const start = Math.floor(Date.UTC(2026, 0, 15, 9, 0, 0) / 1000);
+  assertEquals(buildLoggedPair("2026-01-15", 2), [start, start + 7200]);
+  // Fractional hours -> rounded seconds.
+  assertEquals(buildLoggedPair("2026-01-15", 1.5), [start, start + 5400]);
+  // A note is appended as a third element; absent -> a plain pair.
+  assertEquals(buildLoggedPair("2026-01-15", 1, "Consulting"), [
+    start,
+    start + 3600,
+    "Consulting",
+  ]);
+});
+
+Deno.test("buildLoggedPair: a malformed date throws [TLT-01b]", () => {
+  assertThrows(() => buildLoggedPair("01-15-2026", 1), Error, "YYYY-MM-DD");
+  assertThrows(() => buildLoggedPair("", 1), Error, "YYYY-MM-DD");
+});
+
+Deno.test("decideLogTime: logs a new pair; identical re-apply is skipped-duplicate, unchanged [TLT-02]", () => {
+  const pair = buildLoggedPair("2026-01-15", 2);
+  const fresh = decideLogTime([], pair);
+  assertEquals(fresh.action, "logged");
+  assertEquals(fresh.changed, true);
+  assertEquals(fresh.newLog, [pair]);
+
+  // Re-apply the SAME pair -> idempotent no-op, no duplicate.
+  const dup = decideLogTime([pair], pair);
+  assertEquals(dup.action, "skipped-duplicate");
+  assertEquals(dup.changed, false);
+  assertEquals(dup.newLog, [pair]);
+
+  // MERGES with a pre-existing UNRELATED pair -- never clobbers it.
+  const merged = decideLogTime([[1, 2]], pair);
+  assertEquals(merged.action, "logged");
+  assertEquals(merged.changed, true);
+  assertEquals(merged.newLog, [[1, 2], pair]);
+});
+
+Deno.test("logTaskTime: builds the pair and PUTs the merged time_log (taskId path) [TLT-03]", async () => {
+  const { f, calls } = timerTaskFetcher({
+    id: "abc123",
+    timeLog: "[[100,200]]",
+  });
+  const { context, writes } = stubContext();
+  const start = Math.floor(Date.UTC(2026, 0, 15, 9, 0, 0) / 1000);
+  await model.methods.logTaskTime.execute(
+    // deno-lint-ignore no-explicit-any
+    {
+      taskId: "abc123",
+      date: "2026-01-15",
+      hours: 2,
+      dryRun: false,
+      _fetch: f,
+    } as any,
+    context,
+  );
+  assertEquals(putCount(calls), 1);
+  assertEquals(putTimeLog(calls), [[100, 200], [start, start + 7200]]);
+  assertEquals(writes[0].spec, "timeLogSync");
+  assertEquals(writes[0].data.action, "logged");
+  assertEquals(writes[0].data.taskId, "abc123");
+  assertEquals(writes[0].data.dryRun, false);
+});
+
+Deno.test("logTaskTime: idempotent re-apply of the same {task,date,hours} is skipped-duplicate, NO PUT [TLT-04]", async () => {
+  const pair = buildLoggedPair("2026-01-15", 2);
+  const { f, calls } = timerTaskFetcher({
+    id: "abc123",
+    timeLog: JSON.stringify([pair]),
+  });
+  const { context, writes } = stubContext();
+  await model.methods.logTaskTime.execute(
+    // deno-lint-ignore no-explicit-any
+    {
+      taskId: "abc123",
+      date: "2026-01-15",
+      hours: 2,
+      dryRun: false,
+      _fetch: f,
+    } as any,
+    context,
+  );
+  assertEquals(putCount(calls), 0);
+  assertEquals(writes[0].data.action, "skipped-duplicate");
+});
+
+Deno.test("logTaskTime: MERGES with a pre-existing unrelated pair, never clobbers it [TLT-05]", async () => {
+  const { f, calls } = timerTaskFetcher({
+    id: "abc123",
+    timeLog: "[[1,2]]",
+  });
+  const { context } = stubContext();
+  const start = Math.floor(Date.UTC(2026, 0, 15, 9, 0, 0) / 1000);
+  await model.methods.logTaskTime.execute(
+    // deno-lint-ignore no-explicit-any
+    {
+      taskId: "abc123",
+      date: "2026-01-15",
+      hours: 1,
+      dryRun: false,
+      _fetch: f,
+    } as any,
+    context,
+  );
+  assertEquals(putTimeLog(calls), [[1, 2], [start, start + 3600]]);
+});
+
+Deno.test("logTaskTime: dryRun (default true) returns the would-be outcome and NEVER PUTs [TLT-06]", async () => {
+  const { f, calls } = timerTaskFetcher({ id: "abc123", timeLog: "[]" });
+  const { context, writes } = stubContext(); // CFG.dryRun === true
+  await model.methods.logTaskTime.execute(
+    // deno-lint-ignore no-explicit-any
+    { taskId: "abc123", date: "2026-01-15", hours: 1, _fetch: f } as any,
+    context,
+  );
+  assertEquals(putCount(calls), 0);
+  assertEquals(writes[0].data.action, "logged"); // would-be outcome
+  assertEquals(writes[0].data.dryRun, true);
+});
+
+Deno.test("logTaskTime: resolves via taskNumber -> custom_value1 before reading/merging [TLT-07]", async () => {
+  // NB: the resolved id MUST be a valid IN hashid (alphanumeric, no path
+  // separators) -- it is interpolated into the GET/PUT path, so it clears the
+  // same TASK_ID_CHARSET guard upsertTask applies to clientId/projectId.
+  const { f, calls } = logTimeFetcher({
+    listRows: [{ id: "taskX9", custom_value1: "T-9" }],
+    timeLog: "[[1,2]]",
+  });
+  const { context, writes } = stubContext();
+  const start = Math.floor(Date.UTC(2026, 0, 15, 9, 0, 0) / 1000);
+  await model.methods.logTaskTime.execute(
+    // deno-lint-ignore no-explicit-any
+    {
+      taskNumber: "T-9",
+      date: "2026-01-15",
+      hours: 1,
+      dryRun: false,
+      _fetch: f,
+    } as any,
+    context,
+  );
+  assertEquals(putCount(calls), 1);
+  assertEquals(
+    calls.find((c) => c.method === "PUT")!.url.includes("/tasks/taskX9"),
+    true,
+  );
+  assertEquals(putTimeLog(calls), [[1, 2], [start, start + 3600]]);
+  assertEquals(writes[0].data.taskId, "taskX9");
+  assertEquals(writes[0].data.number, "T-9");
+});
+
+Deno.test("logTaskTime: no live task matches the number -> error row, NO PUT [TLT-08]", async () => {
+  const { f, calls } = logTimeFetcher({ listRows: [] });
+  const { context, writes } = stubContext();
+  await model.methods.logTaskTime.execute(
+    // deno-lint-ignore no-explicit-any
+    {
+      taskNumber: "T-missing",
+      date: "2026-01-15",
+      hours: 1,
+      dryRun: false,
+      _fetch: f,
+    } as any,
+    context,
+  );
+  assertEquals(putCount(calls), 0);
+  assertEquals(writes[0].data.action, "error");
+  assertEquals(
+    (writes[0].data.reason as string).includes("no live task found"),
+    true,
+  );
+});
+
+Deno.test("logTaskTime: a path-traversal taskId is rejected before any fetch -- error row, not a throw [TLT-09]", async () => {
+  const { f, calls } = logTimeFetcher({});
+  const { context, writes } = stubContext();
+  await model.methods.logTaskTime.execute(
+    // deno-lint-ignore no-explicit-any
+    {
+      taskId: "../../users/5",
+      date: "2026-01-15",
+      hours: 1,
+      dryRun: false,
+      _fetch: f,
+    } as any,
+    context,
+  );
+  assertEquals(calls.length, 0); // never reached the network seam
+  assertEquals(writes[0].data.action, "error");
+  assertEquals(
+    (writes[0].data.reason as string).includes("alphanumeric"),
+    true,
+  );
+});
+
+Deno.test("logTaskTime: a non-positive hours is rejected -- error row [TLT-10]", async () => {
+  const { f, calls } = timerTaskFetcher({ id: "abc123", timeLog: "[]" });
+  const { context, writes } = stubContext();
+  await model.methods.logTaskTime.execute(
+    // deno-lint-ignore no-explicit-any
+    {
+      taskId: "abc123",
+      date: "2026-01-15",
+      hours: 0,
+      dryRun: false,
+      _fetch: f,
+    } as any,
+    context,
+  );
+  assertEquals(calls.length, 0);
+  assertEquals(writes[0].data.action, "error");
+  assertEquals(
+    (writes[0].data.reason as string).includes("positive"),
+    true,
+  );
+});
+
+Deno.test("mapUserToBody: email defaults to `key`; first/last optional [EU-01]", () => {
+  const bare = mapUserToBody({ key: "avery@example.com" });
+  assertEquals(bare, { email: "avery@example.com" });
+
+  const full = mapUserToBody({
+    key: "EMP-1",
+    email: "avery@example.com",
+    firstName: "Avery",
+    lastName: "Kim",
+  });
+  assertEquals(full.email, "avery@example.com");
+  assertEquals(full.first_name, "Avery");
+  assertEquals(full.last_name, "Kim");
+});
+
+/** A fake {@link FetchLike} for ensureUser: GET /users returns `existing`; POST returns `createdId`. */
+function userFetcher(
+  opts: {
+    existing?: Array<Record<string, unknown>>;
+    createdId?: string;
+  } = {},
+): { f: FetchLike; calls: WFetchRec[] } {
+  const calls: WFetchRec[] = [];
+  const f: FetchLike = (url, init) => {
+    calls.push({
+      url,
+      method: init?.method,
+      headers: init?.headers,
+      body: init?.body,
+    });
+    if ((init?.method ?? "GET") === "POST") {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () =>
+          Promise.resolve({ data: { id: opts.createdId ?? "user-new" } }),
+      });
+    }
+    const rows = opts.existing ?? [];
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: () =>
+        Promise.resolve({
+          data: rows,
+          meta: { pagination: { current_page: 1, total_pages: 1 } },
+        }),
+    });
+  };
+  return { f, calls };
+}
+
+Deno.test("ensureUser: creates when absent, returns the resolved id [EU-02]", async () => {
+  const { f, calls } = userFetcher({ createdId: "user-1" });
+  const r = await ensureUser(
+    CFG,
+    { key: "avery@example.com", firstName: "Avery" },
+    false,
+    f,
+  );
+  assertEquals(r.action, "created");
+  assertEquals(r.userId, "user-1");
+  const post = calls.find((c) => c.method === "POST")!;
+  const body = JSON.parse(post.body!) as Record<string, unknown>;
+  assertEquals(body.email, "avery@example.com");
+});
+
+Deno.test("ensureUser: an existing (case-variant) email match -> exists, NO duplicate create [EU-03]", async () => {
+  const { f, calls } = userFetcher({
+    existing: [{ id: "user-9", email: "Avery@Example.com" }],
+  });
+  const r = await ensureUser(CFG, { key: "avery@example.com" }, false, f);
+  assertEquals(r.action, "exists");
+  assertEquals(r.userId, "user-9");
+  assertEquals(calls.some((c) => c.method === "POST"), false);
+});
+
+Deno.test("ensureUser: dryRun previews would-create, NO POST [EU-04]", async () => {
+  const { f, calls } = userFetcher();
+  const r = await ensureUser(CFG, { key: "avery@example.com" }, true, f);
+  assertEquals(r.action, "would-create");
+  assertEquals(r.userId, null);
+  assertEquals(calls.some((c) => c.method === "POST"), false);
+});
+
+Deno.test("ensureUser: a blank key throws [EU-05]", async () => {
+  const { f } = userFetcher();
+  await assertRejects(
+    () => ensureUser(CFG, { key: "" }, false, f),
+    Error,
+    "non-blank",
+  );
+});
+
+Deno.test("ensureUser method: writes a userSync row carrying only key/userId/action [EU-06]", async () => {
+  const { f } = userFetcher();
+  const { context, writes } = stubContext();
+  await model.methods.ensureUser.execute(
+    // deno-lint-ignore no-explicit-any
+    { key: "avery@example.com", dryRun: true, _fetch: f } as any,
+    context,
+  );
+  assertEquals(writes[0].spec, "userSync");
+  assertEquals(writes[0].name, "userSync");
+  assertEquals(writes[0].data.key, "avery@example.com");
+  assertEquals(writes[0].data.action, "would-create");
+  assertEquals(Object.keys(writes[0].data).sort(), [
+    "action",
+    "at",
+    "dryRun",
+    "key",
+    "reason",
+    "userId",
+  ]);
+});
+
+Deno.test("ensureUser method: a blank key is caught -> error row, never a rejected call [EU-07]", async () => {
+  const { f, calls } = userFetcher();
+  const { context, writes } = stubContext();
+  await model.methods.ensureUser.execute(
+    // deno-lint-ignore no-explicit-any
+    { key: "", dryRun: true, _fetch: f } as any,
+    context,
+  );
+  assertEquals(calls.length, 0);
+  assertEquals(writes[0].data.action, "error");
+  assertEquals(
+    (writes[0].data.reason as string).includes("non-blank"),
+    true,
+  );
+});
+
+Deno.test("ensureUser method: resource name is FIXED userSync, even if a caller passes a scope-like arg [EU-08]", async () => {
+  // F1: ensureUser has NO syncScope -- a caller passing one (e.g. a stale
+  // integration still shaped like the other upsert* methods) must NOT have
+  // it interpolated into the resource name, since `key` is often an email
+  // and that would leak it un-vaulted into a durable CEL-addressable name.
+  const { f } = userFetcher();
+  const { context, writes } = stubContext();
+  await model.methods.ensureUser.execute(
+    // deno-lint-ignore no-explicit-any
+    {
+      key: "avery@example.com",
+      dryRun: true,
+      syncScope: "w2-employee",
+      _fetch: f,
+    } as any,
+    context,
+  );
+  assertEquals(writes[0].name, "userSync");
+});
+
+Deno.test("ensureUser: a trashed (is_deleted) email match is NOT 'exists' -> creates a new live user [EU-09]", async () => {
+  // F2: with_trashed=true widens the GET, but a soft-deleted match must be
+  // treated as ABSENT -- otherwise upsertTasks could silently assign a task
+  // to a dead user id.
+  const { f, calls } = userFetcher({
+    existing: [
+      { id: "user-dead", email: "avery@example.com", is_deleted: true },
+    ],
+    createdId: "user-live",
+  });
+  const r = await ensureUser(CFG, { key: "avery@example.com" }, false, f);
+  assertEquals(r.action, "created");
+  assertEquals(r.userId, "user-live");
+  assertEquals(calls.some((c) => c.method === "POST"), true);
+});
+
+Deno.test("ensureUser: an archived (archived_at set) email match is NOT 'exists' -> creates a new live user [EU-10]", async () => {
+  const { f, calls } = userFetcher({
+    existing: [
+      { id: "user-archived", email: "avery@example.com", archived_at: 123 },
+    ],
+    createdId: "user-live-2",
+  });
+  const r = await ensureUser(CFG, { key: "avery@example.com" }, false, f);
+  assertEquals(r.action, "created");
+  assertEquals(r.userId, "user-live-2");
+  assertEquals(calls.some((c) => c.method === "POST"), true);
+});
+
+Deno.test("ensureUser: a LIVE email match with archived_at:0 IS 'exists' -> no duplicate create [EU-11]", async () => {
+  // Regression guard: IN returns archived_at:0 (NOT null) for a live,
+  // not-archived user. The dedup must treat 0 as LIVE (archived is strictly
+  // > 0) or it would create a duplicate on every call, defeating dedup.
+  const { f, calls } = userFetcher({
+    existing: [
+      { id: "user-live-9", email: "avery@example.com", archived_at: 0 },
+    ],
+    createdId: "user-dup",
+  });
+  const r = await ensureUser(CFG, { key: "avery@example.com" }, false, f);
+  assertEquals(r.action, "exists");
+  assertEquals(r.userId, "user-live-9");
+  assertEquals(calls.some((c) => c.method === "POST"), false);
+});
+
+Deno.test("mapTaskToBody: assignedUserId sets assigned_user_id; absent is unchanged [TAS-01]", () => {
+  const withAssignee = mapTaskToBody(taskInput({ assignedUserId: "user-1" }));
+  assertEquals(withAssignee.assigned_user_id, "user-1");
+
+  const without = mapTaskToBody(taskInput());
+  assertEquals("assigned_user_id" in without, false);
+});
+
+Deno.test("upsertTasks: a malformed assignedUserId is skip invalid, NO POST [TAS-02]", async () => {
+  const { f, calls } = taskFetcher();
+  const { sync, errs } = await runUpsertTasks(
+    [taskInput({ assignedUserId: "../../users/5" })],
+    f,
+    false,
+  );
+  assertEquals(
+    (sync.data.rows as Array<Record<string, unknown>>)[0].reason,
+    "invalid",
+  );
+  assertEquals(
+    (errs.data.rows as Array<Record<string, unknown>>)[0].error,
+    "invalid",
+  );
+  assertEquals(postCount(calls), 0);
+});
+
+Deno.test("upsertTask: real create POSTs assigned_user_id when provided, for Acme Collective's task [TAS-03]", async () => {
+  // assignedUserId clears the SAME TASK_ID_CHARSET gate as clientId/projectId
+  // (alphanumeric IN hashid only).
+  const { f, calls } = taskFetcher({ createdId: "task777" });
+  const r = await upsertTask(
+    CFG,
+    taskInput({
+      description: "Acme Collective onboarding",
+      assignedUserId: "user1",
+    }),
+    false,
+    f,
+  );
+  assertEquals(r.action, "created");
+  const post = calls.find((c) => c.method === "POST")!;
+  const body = JSON.parse(post.body!) as Record<string, unknown>;
+  assertEquals(body.assigned_user_id, "user1");
 });
 
 // ===========================================================================
