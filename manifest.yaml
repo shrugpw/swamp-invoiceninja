@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@shrug/invoiceninja"
-version: "2026.11.07.1"
+version: "2026.11.09.1"
 description: |
   Invoice Ninja v5 (`/api/v1`) model — read-side snapshots (invoices, payments,
   expenses, vendors, expense categories) plus an idempotent, gated write path
@@ -60,6 +60,9 @@ description: |
   winning over the bank's raw category.
 
   Header token auth (vaulted), `X-Requested-With` mandatory on every request.
+  User create/modify (`ensureUser`) additionally require the vaulted admin
+  password confirmation, sent as `X-API-PASSWORD` (IN rejects `POST /users`
+  without it, HTTP 412); it is scoped to the user-write path only.
 
 repository: https://github.com/shrugpw/swamp-invoiceninja
 

@@ -60,6 +60,18 @@ const GlobalArgsSchema = z.object({
       'Full-account IN API token; CEL ref → vault.get("invoiceninja","API_TOKEN"). ' +
         "Mint under a restricted IN user for least privilege.",
     ),
+  apiPassword: z
+    .string()
+    .optional()
+    .meta({ sensitive: true })
+    .describe(
+      "Admin account password confirmation IN requires (sent as the " +
+        "X-API-PASSWORD header) on user create/modify endpoints; without it a " +
+        'POST /users returns HTTP 412. CEL ref → vault.get("invoiceninja",' +
+        '"API_PASSWORD"). Optional: only the user-write path (ensureUser) needs ' +
+        "it, so read-only and non-user-write instances leave it unset. Never " +
+        "logged or persisted.",
+    ),
   perPage: z
     .number()
     .int()
@@ -1412,6 +1424,13 @@ export type FetchLike = (
 export interface InFetchOptions {
   query?: Array<[string, string]>;
   body?: Record<string, unknown>;
+  // The admin-password confirmation (X-API-PASSWORD) IN requires on user
+  // create/modify endpoints (POST/PUT /users). A NAMED, opt-in option — NOT a
+  // blanket `headers` map and NOT an unconditional header — so this secret is
+  // scoped to callers that explicitly pass it (currently only the ensureUser
+  // write path) and never leaks onto reads. When absent, the header is omitted
+  // and every GET/POST/PUT is byte-for-byte unchanged.
+  apiPassword?: string;
 }
 
 /**
@@ -1446,6 +1465,12 @@ export async function inFetch(
   };
   if (method === "POST" || method === "PUT") {
     headers["Content-Type"] = "application/json";
+  }
+  // Opt-in admin-password confirmation (X-API-PASSWORD): set ONLY when the
+  // caller passed a non-empty apiPassword (the user-write path). Scoped here so
+  // it never rides along on reads or on writes that don't need it.
+  if (opts.apiPassword) {
+    headers["X-API-PASSWORD"] = opts.apiPassword;
   }
 
   const maxAttempts = 5;
@@ -2727,8 +2752,27 @@ export async function ensureUser(
     seen?.set(key, null);
     return { action: "would-create", userId: null };
   }
-  // (5) real create.
-  const json = await inFetch(cfg, "POST", "users", { body }, doFetch);
+  // (5) real create. Fail CLOSED before issuing the POST: IN requires the admin
+  // password confirmation (X-API-PASSWORD) on POST /users — without it the create
+  // returns HTTP 412. The dedup GET above has already fired; this guard stops the
+  // CREATE (the POST) rather than the request round-trip as a whole, surfacing a
+  // clear configuration error instead of an opaque 412. NEVER include the
+  // password (or the key) in the message.
+  const apiPassword = strOrNull(cfg.apiPassword);
+  if (apiPassword === null) {
+    throw new Error(
+      "ensureUser: apiPassword (X-API-PASSWORD) is required to create an IN " +
+        "user; IN rejects POST /users without it (HTTP 412). Set it via " +
+        'vault.get("invoiceninja","API_PASSWORD").',
+    );
+  }
+  const json = await inFetch(
+    cfg,
+    "POST",
+    "users",
+    { body, apiPassword },
+    doFetch,
+  );
   const data = (json.data ?? {}) as Record<string, unknown>;
   const userId = strOrNull(data.id);
   seen?.set(key, userId);
@@ -4484,7 +4528,7 @@ const UserSyncSchema = z.object({
 
 export const model = {
   type: "@shrug/invoiceninja",
-  version: "2026.11.07.1",
+  version: "2026.11.09.1",
   description:
     "Invoice Ninja v5 (/api/v1): read invoices/payments/expenses + mapping " +
     "lists, an idempotent gated-write upsertExpense (dedup on custom_value1), a " +
@@ -4505,7 +4549,8 @@ export const model = {
     "upsertClients, PII-sensitive short-lived snapshot), projects (list/get + " +
     "upsertProjects), tasks (list/get + " +
     "upsertTasks), and a stateful task timer (startTask/stopTask over time_log). " +
-    "All writes gated behind dryRun (default true).",
+    "All writes gated behind dryRun (default true). User writes (ensureUser) " +
+    "additionally require the vaulted admin password sent as X-API-PASSWORD.",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -4666,6 +4711,18 @@ export const model = {
         "Additive -- new methods + timeLogSync/userSync resources only; " +
         "globalArguments unchanged, so this is a no-op attribute migration " +
         "(existing instances upgrade cleanly with no field changes).",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.09.1",
+      description:
+        "Add the optional, vaulted apiPassword config field and send it as the " +
+        "X-API-PASSWORD header on the user-write path (ensureUser) — IN rejects " +
+        "POST /users without the admin password confirmation (HTTP 412). " +
+        "ensureUser now fails closed (clear error, no POST) when apiPassword is " +
+        "unset. Additive — the new field is optional and scoped to the write; " +
+        "read-only / non-user-write instances are unaffected, so this is a no-op " +
+        "attribute migration.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

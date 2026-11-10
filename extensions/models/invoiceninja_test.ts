@@ -98,10 +98,14 @@ import {
 /** Connection config type, derived from the seam so no `any` is needed. */
 type Cfg = Parameters<typeof inFetch>[0];
 
-/** Resolved config (token present; header expected on every request). */
+/** Resolved config (token present; header expected on every request).
+ * `apiPassword` is the vaulted admin-password confirmation IN requires on the
+ * user-write path (sent as X-API-PASSWORD); present here so the ensureUser
+ * live-create cases exercise the create past its fail-closed guard. */
 const CFG = {
   baseUrl: "https://clients.example.com/api/v1",
   apiToken: "SEKRIT",
+  apiPassword: "PW-SEKRIT",
   perPage: 100,
   withTrashed: false,
   dryRun: true,
@@ -6665,6 +6669,51 @@ Deno.test("ensureUser: a LIVE email match with archived_at:0 IS 'exists' -> no d
   const r = await ensureUser(CFG, { key: "avery@example.com" }, false, f);
   assertEquals(r.action, "exists");
   assertEquals(r.userId, "user-live-9");
+  assertEquals(calls.some((c) => c.method === "POST"), false);
+});
+
+Deno.test("ensureUser: a live create sends the X-API-PASSWORD header [EU-12]", async () => {
+  // IN rejects POST /users without the admin-password confirmation (HTTP 412).
+  // The create must carry X-API-PASSWORD (from cfg.apiPassword) alongside the
+  // token.
+  const { f, calls } = userFetcher({ createdId: "user-1" });
+  const r = await ensureUser(CFG, { key: "avery@example.com" }, false, f);
+  assertEquals(r.action, "created");
+  const post = calls.find((c) => c.method === "POST")!;
+  assertEquals(post.headers?.["X-API-PASSWORD"], "PW-SEKRIT");
+  assertEquals(post.headers?.["X-API-TOKEN"], "SEKRIT");
+});
+
+Deno.test("ensureUser: fail CLOSED when apiPassword is unset -> throws, NO POST [EU-13]", async () => {
+  // Without the admin password, the create would 412. Guard it: stop the CREATE
+  // (the POST) with a clear config error. The dedup GET still fires first.
+  const { f, calls } = userFetcher();
+  const noPw = { ...CFG, apiPassword: undefined } as unknown as Cfg;
+  await assertRejects(
+    () => ensureUser(noPw, { key: "avery@example.com" }, false, f),
+    Error,
+    "apiPassword",
+  );
+  // The dedup GET ran; the create POST never did.
+  assertEquals(calls.some((c) => c.method === "POST"), false);
+  assertEquals(calls.some((c) => (c.method ?? "GET") === "GET"), true);
+});
+
+Deno.test("ensureUser: the dedup GET never carries X-API-PASSWORD (write-scoped) [EU-14]", async () => {
+  // The password is scoped to the user WRITE. An 'exists' resolution only does
+  // the dedup GET (inFetchAll /users) -- that read must send X-API-TOKEN but
+  // NEVER leak X-API-PASSWORD onto a read.
+  const { f, calls } = userFetcher({
+    existing: [{ id: "user-9", email: "avery@example.com" }],
+  });
+  const r = await ensureUser(CFG, { key: "avery@example.com" }, false, f);
+  assertEquals(r.action, "exists");
+  const gets = calls.filter((c) => (c.method ?? "GET") === "GET");
+  assertEquals(gets.length > 0, true);
+  for (const g of gets) {
+    assertEquals(g.headers?.["X-API-TOKEN"], "SEKRIT");
+    assertEquals(g.headers?.["X-API-PASSWORD"], undefined);
+  }
   assertEquals(calls.some((c) => c.method === "POST"), false);
 });
 
