@@ -906,6 +906,33 @@ Deno.test("mapTxnToExpense: unmatched vendor → null vendor_id, category falls 
   assertEquals(vendorFor(null, MAPPING), null);
 });
 
+// client_id passthrough (additive) ------------------------------------------
+Deno.test("mapTxnToExpense: a valid clientId passes through to client_id", () => {
+  const body = mapTxnToExpense(txn({ clientId: "Opnx3b" }), MAPPING);
+  assertEquals(body.client_id, "Opnx3b");
+});
+
+Deno.test("mapTxnToExpense: absent clientId yields NO client_id key (byte-identical)", () => {
+  const body = mapTxnToExpense(txn(), MAPPING);
+  assertEquals("client_id" in body, false);
+  // An explicit empty-string clientId coerces to null → still no key.
+  assertEquals("client_id" in mapTxnToExpense(txn({ clientId: "" }), MAPPING), false);
+});
+
+Deno.test("mapTxnToExpense: a malformed clientId is rejected (throws, never in body)", () => {
+  // The expense path has no downstream charset gate, so the builder validates.
+  assertThrows(
+    () => mapTxnToExpense(txn({ clientId: "../../users/5" }), MAPPING),
+    Error,
+    "not a valid Invoice Ninja hashid",
+  );
+  assertThrows(
+    () => mapTxnToExpense(txn({ clientId: "bad id" }), MAPPING),
+    Error,
+    "not a valid Invoice Ninja hashid",
+  );
+});
+
 // (9) candidate gate ---------------------------------------------------------
 Deno.test("isCandidate: only settled USD debits qualify", () => {
   assertEquals(isCandidate(txn()), true);

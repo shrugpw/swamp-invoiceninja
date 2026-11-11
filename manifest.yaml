@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@shrug/invoiceninja"
-version: "2026.11.09.1"
+version: "2026.11.10.1"
 description: |
   Invoice Ninja v5 (`/api/v1`) model — read-side snapshots (invoices, payments,
   expenses, vendors, expense categories) plus an idempotent, gated write path

@@ -1763,13 +1763,27 @@ export function vendorFor(
 }
 
 /**
- * Build the Invoice Ninja expense POST body from a BankTxn (§7.3). PURE — no
- * I/O. The dedup key goes in `custom_value1` (the only writable + `?filter=`-
- * searchable field) and is mirrored to `transaction_reference` for display
- * only. `number` is omitted so IN auto-assigns. An unmatched vendor yields a
- * null `vendor_id` (allowed) and falls the category back to `fallbackCategoryId`.
+ * Build the Invoice Ninja expense POST body from a BankTxn (§7.3). The dedup
+ * key goes in `custom_value1` (the only writable + `?filter=`-searchable field)
+ * and is mirrored to `transaction_reference` for display only. `number` is
+ * omitted so IN auto-assigns. An unmatched vendor yields a null `vendor_id`
+ * (allowed) and falls the category back to `fallbackCategoryId`.
  *
- * @param txn A candidate BankTxn (§6).
+ * Per-txn client attribution (ADDITIVE, client_id passthrough): when the txn
+ * carries a non-null `clientId`, it is written to `body.client_id` so a
+ * passthrough expense (e.g. a vendor invoice line re-billed to a client) is
+ * owned by that client. A txn with NO `clientId` yields a byte-identical body
+ * to the pre-passthrough shape (Shrug-own opex lines carry none), so the change
+ * is purely additive. Because the expense path has NO downstream charset gate
+ * (`isValidHashid` guards only the task/client/project/payment surfaces), this
+ * builder VALIDATES a supplied `clientId` against the IN hashid charset here and
+ * THROWS on a malformed id rather than POSTing an unvalidated value into
+ * `client_id` (a full-account token would otherwise make a crafted id a
+ * host-endpoint concern). NO-LONGER-PURE in exactly this one case: a non-null
+ * invalid `clientId` throws; `upsertExpenses`'s per-txn try/catch folds that
+ * throw into an `expenseSyncErrors` row (the batch is not aborted).
+ *
+ * @param txn A candidate BankTxn (§6); optional `clientId` for passthrough.
  * @param mapping The resolved mapping tables (§7.3).
  */
 export function mapTxnToExpense(
@@ -1790,7 +1804,7 @@ export function mapTxnToExpense(
     ownLookupNorm(mapping.categories, rawCategory) ??
     ownLookupNorm(mapping.categories, counterparty) ??
     mapping.fallbackCategoryId;
-  return {
+  const body: Record<string, unknown> = {
     amount: numOrNull(txn.amount),
     date: strOrNull(txn.postedDate),
     currency_id: mapping.currencyId,
@@ -1801,6 +1815,24 @@ export function mapTxnToExpense(
     public_notes: strOrNull(txn.description),
     // `number` intentionally omitted → IN auto-assigns.
   };
+  // Per-txn client attribution passthrough (additive). Absent clientId ⇒ no
+  // `client_id` key at all (byte-identical to the pre-passthrough body). A
+  // supplied clientId is charset-validated HERE (the expense path has no
+  // downstream gate, unlike mapTaskToBody's path which upsertTask gates) and a
+  // malformed id THROWS rather than being POSTed.
+  const clientId = strOrNull(txn.clientId);
+  if (clientId !== null) {
+    if (!isValidHashid(clientId)) {
+      throw new Error(
+        `mapTxnToExpense: clientId "${clientId}" for txn "${
+          strOrNull(txn.id) ?? ""
+        }" is not a valid Invoice Ninja hashid (/^[A-Za-z0-9]+$/) — refusing ` +
+          "to POST an unvalidated client_id into the expense body.",
+      );
+    }
+    body.client_id = clientId;
+  }
+  return body;
 }
 
 /** The outcome of a single {@link upsertExpense}. */
@@ -1915,10 +1947,13 @@ export async function upsertExpense(
       unmatchedVendor: false,
     };
   }
-  // (4) build body. FROZEN — mapTxnToExpense is unchanged (§7.3/§7.6); the
-  // resolved ids are read back off the body, never recomputed separately, so
-  // the sentinel check below and the §7.6 projection can never drift from
-  // what actually gets POSTed.
+  // (4) build body (§7.3/§7.6). The vendor/category resolution is unchanged;
+  // the resolved ids are read back off the body, never recomputed separately,
+  // so the sentinel check below and the §7.6 projection can never drift from
+  // what actually gets POSTed. mapTxnToExpense now ALSO carries an additive
+  // per-txn `client_id` passthrough and THROWS on a malformed `clientId`; that
+  // throw surfaces here and is folded into expenseSyncErrors by the
+  // upsertExpenses fan-out's per-txn try/catch (the batch is not aborted).
   const body = mapTxnToExpense(txn, mapping);
   const unmatchedVendor = body.vendor_id === null;
   const vendorId = typeof body.vendor_id === "string" ? body.vendor_id : null;
